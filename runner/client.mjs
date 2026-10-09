@@ -1,7 +1,7 @@
 import { getIDToken } from '@actions/core';
 import { createHash } from 'node:crypto';
 import { createReadStream, createWriteStream } from 'node:fs';
-import { chmod, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { pipeline } from 'node:stream/promises';
@@ -217,8 +217,7 @@ export async function execute({ input = process.env, fetchImpl = fetch } = {}) {
     if (heartbeatError) throw new ClientError('HEARTBEAT_FAILED');
     const verification = await validateOutput(outputDir, manifest, verificationSchema);
     await chmod(outputDir, 0o700);
-    const reportPath = path.join(work, 'verification.json');
-    await rename(path.join(outputDir, 'verification.json'), reportPath);
+    const reportPath = path.join(outputDir, 'verification.json');
     await writeFile(reportPath, `${JSON.stringify(verification)}\n`, { mode: 0o600 });
     return { workDir: work, outputDir, reportPath };
   } catch (error) {
@@ -230,21 +229,21 @@ export async function execute({ input = process.env, fetchImpl = fetch } = {}) {
   }
 }
 
-export async function complete({ input = process.env, fetchImpl = fetch } = {}) {
+export async function complete({ input = process.env, fetchImpl = fetch, tokenProvider = getOidcToken } = {}) {
   const invocation = validateInvocation({ requestId: input.INPUT_REQUEST_ID, generation: input.INPUT_GENERATION, nonce: input.INPUT_NONCE, visibility: input.RUNNER_VISIBILITY });
-  const outputArtifactId = input.INPUT_ARTIFACT_ID;
+  const outputArtifactId = Number(input.INPUT_ARTIFACT_ID);
   const outputArchiveDigest = input.INPUT_ARTIFACT_DIGEST;
-  if (!/^\d+$/.test(outputArtifactId ?? '') || !DIGEST_RE.test(outputArchiveDigest ?? '')) throw new ClientError('INVALID_INPUT');
+  if (!Number.isSafeInteger(outputArtifactId) || outputArtifactId<1 || !DIGEST_RE.test(outputArchiveDigest ?? '')) throw new ClientError('INVALID_INPUT');
   const workDir = path.resolve(input.INPUT_WORK_DIR ?? '');
   const parent = tempRoot();
   if (path.dirname(workDir) !== parent || !path.basename(workDir).startsWith('signing-client-')) throw new ClientError('INVALID_TEMP_DIR');
   const marker = (await readFile(path.join(workDir, '.signing-run'), 'utf8')).split('\n');
   if (marker[0] !== invocation.requestId || marker[1] !== String(invocation.generation)) throw new ClientError('INVALID_TEMP_DIR');
-  const reportPath = path.join(workDir, 'verification.json');
+  const reportPath = path.join(workDir, 'output', 'verification.json');
   const { verificationSchema } = await import('./contract.mjs');
   const verification = verificationSchema.parse(JSON.parse(await readFile(reportPath, 'utf8')));
   if (verification.request_id !== invocation.requestId || verification.generation !== invocation.generation) throw new ClientError('INVALID_OUTPUT');
-  const api = createApi({ fetchImpl });
+  const api = createApi({ fetchImpl, tokenProvider });
   await api('complete', invocation, { output_artifact_id: outputArtifactId, output_archive_digest: outputArchiveDigest, verification_report: verification });
   return { state: 'verifying' };
 }
