@@ -1,4 +1,3 @@
-import { getIDToken } from '@actions/core';
 import { createHash } from 'node:crypto';
 import { createReadStream, createWriteStream } from 'node:fs';
 import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
@@ -11,6 +10,7 @@ const API_ORIGIN = 'https://sign.voidcarve.com';
 const MAX_JSON_BYTES = 1_000_000;
 const ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const NONCE_RE = /^[A-Za-z0-9_-]{43}$/;
+const RUNNER_TOKEN_RE = /^vcr_[A-Za-z0-9_-]{43}$/;
 const DIGEST_RE = /^sha256:[a-f0-9]{64}$/;
 const ARTIFACT_HOSTS = [/^productionresultssa\d+\.blob\.core\.windows\.net$/, /^pipelines\.actions\.githubusercontent\.com$/, /^results-receiver\.actions\.githubusercontent\.com$/];
 const SAFE_OUTPUTS = new Set(['signed.tar.gz', 'product.zip', 'signed.dmg', 'product.dmg']);
@@ -22,9 +22,10 @@ export class ClientError extends Error {
 export function validateInvocation(input) {
   if (!input || !ID_RE.test(input.requestId ?? '') || !/^[1-9]\d*$/.test(input.generation ?? '') || !NONCE_RE.test(input.nonce ?? '')) throw new ClientError('INVALID_INPUT');
   const generation = Number(input.generation);
-  if (!Number.isSafeInteger(generation) || generation < 1) throw new ClientError('INVALID_INPUT');
+  const runId = Number(input.runId);
+  if (!Number.isSafeInteger(generation) || generation < 1 || !/^[1-9]\d*$/.test(String(input.runId ?? '')) || !Number.isSafeInteger(runId) || String(input.runAttempt) !== '1') throw new ClientError('INVALID_INPUT');
   if (input.visibility !== 'public' && input.visibility !== 'private') throw new ClientError('INVALID_INPUT');
-  return { requestId: input.requestId, generation, nonce: input.nonce, visibility: input.visibility };
+  return { requestId: input.requestId, generation, nonce: input.nonce, visibility: input.visibility, runId, runAttempt: 1 };
 }
 
 export function validateArtifactUrl(value) {
@@ -37,11 +38,6 @@ export function validateArtifactUrl(value) {
 export function validateRoute(action) {
   if (!['claim', 'input', 'authorize-sign', 'heartbeat', 'complete'].includes(action)) throw new ClientError('INVALID_ROUTE');
   return `${API_ORIGIN}/runner/v1/requests`;
-}
-
-async function getOidcToken(audience) {
-  try { return await getIDToken(audience); }
-  catch { throw new ClientError('OIDC_UNAVAILABLE'); }
 }
 
 async function parseJson(response) {
@@ -69,16 +65,16 @@ function validateActionResult(action, body) {
   return body;
 }
 
-export function createApi({ fetchImpl = fetch, tokenProvider = getOidcToken } = {}) {
+export function createApi({ fetchImpl = fetch, runnerToken = process.env.SIGNING_RUNNER_TOKEN } = {}) {
+  if (!RUNNER_TOKEN_RE.test(runnerToken ?? '')) throw new ClientError('RUNNER_TOKEN_UNAVAILABLE');
   return async (action, input, extra = {}) => {
     validateRoute(action);
-    if (!['public','private'].includes(input.visibility)) throw new ClientError('INVALID_INPUT');
-    const token = await tokenProvider(`${API_ORIGIN}/runner/${input.visibility}`);
+    const invocation = validateInvocation(input);
     const url = `${API_ORIGIN}/runner/v1/requests/${encodeURIComponent(input.requestId)}/${action}`;
     const response = await fetchImpl(url, {
       method: 'POST', redirect: 'error',
-      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json', accept: 'application/json' },
-      body: JSON.stringify({ generation: input.generation, nonce: input.nonce, ...extra }),
+      headers: { authorization: `Bearer ${runnerToken}`, 'content-type': 'application/json', accept: 'application/json' },
+      body: JSON.stringify({ ...extra, generation: invocation.generation, nonce: invocation.nonce, run_id: invocation.runId, run_attempt: invocation.runAttempt }),
     });
     if (action === 'complete') {
       if (response.status !== 202) throw new ClientError('API_REQUEST_FAILED');
@@ -129,6 +125,11 @@ function tempRoot() {
   return path.resolve(root);
 }
 
+function invocationFromEnvironment(input) {
+  return validateInvocation({ requestId: input.INPUT_REQUEST_ID, generation: input.INPUT_GENERATION, nonce: input.INPUT_NONCE,
+    visibility: input.RUNNER_VISIBILITY, runId: input.GITHUB_RUN_ID, runAttempt: input.GITHUB_RUN_ATTEMPT });
+}
+
 async function makeRunDir(input) {
   const parent = tempRoot();
   await mkdir(parent, { recursive: true, mode: 0o700 });
@@ -159,8 +160,8 @@ async function validateOutput(outputDir, manifest, verificationSchema) {
 
 export async function execute({ input = process.env, fetchImpl = fetch } = {}) {
   const { credentialsSchema, manifestSchema, verificationSchema } = await import('./contract.mjs');
-  const invocation = validateInvocation({ requestId: input.INPUT_REQUEST_ID, generation: input.INPUT_GENERATION, nonce: input.INPUT_NONCE, visibility: input.RUNNER_VISIBILITY });
-  const api = createApi({ fetchImpl });
+  const invocation = invocationFromEnvironment(input);
+  const api = createApi({ fetchImpl, runnerToken: input.SIGNING_RUNNER_TOKEN });
   const work = await makeRunDir(invocation);
   const inputZip = path.join(work, 'input.zip');
   const outputDir = path.join(work, 'output');
@@ -229,8 +230,8 @@ export async function execute({ input = process.env, fetchImpl = fetch } = {}) {
   }
 }
 
-export async function complete({ input = process.env, fetchImpl = fetch, tokenProvider = getOidcToken } = {}) {
-  const invocation = validateInvocation({ requestId: input.INPUT_REQUEST_ID, generation: input.INPUT_GENERATION, nonce: input.INPUT_NONCE, visibility: input.RUNNER_VISIBILITY });
+export async function complete({ input = process.env, fetchImpl = fetch } = {}) {
+  const invocation = invocationFromEnvironment(input);
   const outputArtifactId = Number(input.INPUT_ARTIFACT_ID);
   const outputArchiveDigest = input.INPUT_ARTIFACT_DIGEST;
   if (!Number.isSafeInteger(outputArtifactId) || outputArtifactId<1 || !DIGEST_RE.test(outputArchiveDigest ?? '')) throw new ClientError('INVALID_INPUT');
@@ -243,13 +244,13 @@ export async function complete({ input = process.env, fetchImpl = fetch, tokenPr
   const { verificationSchema } = await import('./contract.mjs');
   const verification = verificationSchema.parse(JSON.parse(await readFile(reportPath, 'utf8')));
   if (verification.request_id !== invocation.requestId || verification.generation !== invocation.generation) throw new ClientError('INVALID_OUTPUT');
-  const api = createApi({ fetchImpl, tokenProvider });
+  const api = createApi({ fetchImpl, runnerToken: input.SIGNING_RUNNER_TOKEN });
   await api('complete', invocation, { output_artifact_id: outputArtifactId, output_archive_digest: outputArchiveDigest, verification_report: verification });
   return { state: 'verifying' };
 }
 
 export async function cleanup({ input = process.env } = {}) {
-  const invocation = validateInvocation({ requestId: input.INPUT_REQUEST_ID, generation: input.INPUT_GENERATION, nonce: input.INPUT_NONCE, visibility: input.RUNNER_VISIBILITY });
+  const invocation = invocationFromEnvironment(input);
   const workDir = path.resolve(input.INPUT_WORK_DIR ?? '');
   const parent = tempRoot();
   if (path.dirname(workDir) !== parent || !path.basename(workDir).startsWith('signing-client-')) throw new ClientError('INVALID_TEMP_DIR');

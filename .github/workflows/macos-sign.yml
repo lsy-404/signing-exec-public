@@ -18,7 +18,6 @@ on:
 
 permissions:
   contents: read
-  id-token: write
 
 jobs:
   signing:
@@ -31,6 +30,7 @@ jobs:
       INPUT_GENERATION: ${{ inputs.generation }}
       INPUT_NONCE: ${{ inputs.nonce }}
       RUNNER_VISIBILITY: ${{ github.event.repository.private && 'private' || 'public' }}
+      SIGNING_RUNNER_TOKEN: ${{ secrets.SIGNING_RUNNER_TOKEN }}
     steps:
       - name: Reject workflow reruns
         if: ${{ github.run_attempt != 1 }}
