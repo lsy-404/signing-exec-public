@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import { constants } from 'node:fs';
-import { chmod, copyFile, lstat, mkdir, mkdtemp, readFile, readdir, readlink, rm, writeFile } from 'node:fs/promises';
+import { chmod, copyFile, lstat, mkdir, mkdtemp, readFile, readdir, readlink, rm, statfs, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -15,8 +15,20 @@ async function unpack(mode, archive, target, manifest) {
 }
 
 async function mount(image, directory, readOnly = false) {
-  await mkdir(directory,{mode:0o700});
+  await mkdir(directory,{mode:0o700,recursive:true});
   await command('/usr/bin/hdiutil',['attach',...(readOnly?['-readonly']:[]),'-nobrowse','-noautoopen','-owners','off','-mountpoint',directory,image]);
+}
+
+export async function replacementImageSize(image,directory,app,maximum) {
+  const {stdout}=await command('/usr/bin/du',['-sk',app]);
+  const match=stdout.match(/^(\d+)\s/);
+  if (!match) throw new Error('disk image capacity unavailable');
+  const usage=await statfs(directory);
+  const current=(await lstat(image)).size;
+  const growth=Number(match[1])*1024+64*1024*1024-usage.bavail*usage.bsize;
+  const required=growth>0?Math.ceil((current+growth)/(1024*1024))*1024*1024:current;
+  if (!Number.isSafeInteger(required)||required>maximum) throw new Error('disk image exceeds approved limit');
+  return required;
 }
 
 async function layout(directory, manifest) {
@@ -92,11 +104,23 @@ export async function executeDmg(rawManifest,inputArchivePath,outputDir,credenti
       const writable = path.join(work,'writable.dmg');
       await command('/usr/bin/hdiutil',['convert',template,'-format','UDRW','-o',writable]);
       if ((await lstat(writable)).size>manifest.max_unpacked_bytes) throw new Error('disk image exceeds approved limit');
-      attached = path.join(work,'mount');
-      await mount(writable,attached);
+      const mountpoint=path.join(work,'mount');
+      await mount(writable,mountpoint);
+      attached=mountpoint;
       await layout(attached,manifest);
       await inspectBundle(path.join(attached,manifest.bundle_name),manifest,work,false,!manifest.harden_electron_fuses);
       await rm(path.join(attached,manifest.bundle_name),{recursive:true});
+      phase='image-capacity';
+      const capacity=await replacementImageSize(writable,attached,app,manifest.max_unpacked_bytes);
+      if (capacity>(await lstat(writable)).size) {
+        await command('/usr/bin/hdiutil',['detach',attached]);
+        attached=undefined;
+        await command('/usr/bin/hdiutil',['resize','-size',String(capacity),writable]);
+        if ((await lstat(writable)).size>manifest.max_unpacked_bytes) throw new Error('disk image exceeds approved limit');
+        await mount(writable,mountpoint);
+        attached=mountpoint;
+      }
+      phase='image-copy';
       await command('/usr/bin/ditto',[app,path.join(attached,manifest.bundle_name)]);
       await inspectBundle(path.join(attached,manifest.bundle_name),manifest,work,true);
       await command('/usr/bin/hdiutil',['detach',attached]);
@@ -127,8 +151,9 @@ export async function executeDmg(rawManifest,inputArchivePath,outputDir,credenti
     await command('/usr/bin/xcrun',['stapler','validate',image]);
     await verifyImage(image,manifest);
     await command('/usr/sbin/spctl',['--assess','--type','open','--context','context:primary-signature','--verbose=2',image]);
-    attached = path.join(work,'mount');
-    await mount(image,attached,true);
+    const mountpoint=path.join(work,'mount');
+    await mount(image,mountpoint,true);
+    attached=mountpoint;
     await layout(attached,manifest);
     const app = path.join(attached,manifest.bundle_name);
     asarVerified = (await inspectBundle(app,manifest,work,true)).asarVerified;
