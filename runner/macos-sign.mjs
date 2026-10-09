@@ -166,7 +166,7 @@ async function inspectBundle(appPath, manifest, temporary, requireSignatures, re
 }
 
 async function createTar(archivePath, bundleName, baseDir) {
-  await command('/usr/bin/tar', ['-czf', archivePath, '-C', baseDir, bundleName]);
+  await command('/usr/bin/tar', ['-czf', archivePath, '-C', baseDir, bundleName], {env:{...process.env,COPYFILE_DISABLE:'1'}});
 }
 
 async function identityHash(keychain, teamId) {
@@ -379,4 +379,4 @@ export async function executeMacos(manifest, inputArchivePath, outputDir, creden
   }
 }
 
-export { command, fileSha256, identityHash, inspectBundle, keychainSearch, signingRequirement, snapshotArchive };
+export { command, createTar, fileSha256, identityHash, inspectBundle, keychainSearch, signingRequirement, snapshotArchive };
