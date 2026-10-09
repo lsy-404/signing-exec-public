@@ -95,7 +95,7 @@ export async function executeDmg(rawManifest,inputArchivePath,outputDir,credenti
       attached = path.join(work,'mount');
       await mount(writable,attached);
       await layout(attached,manifest);
-      await inspectBundle(path.join(attached,manifest.bundle_name),manifest,work,false);
+      await inspectBundle(path.join(attached,manifest.bundle_name),manifest,work,false,!manifest.harden_electron_fuses);
       await rm(path.join(attached,manifest.bundle_name),{recursive:true});
       await command('/usr/bin/ditto',[app,path.join(attached,manifest.bundle_name)]);
       await inspectBundle(path.join(attached,manifest.bundle_name),manifest,work,true);
