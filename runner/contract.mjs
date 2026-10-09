@@ -3,6 +3,9 @@ import { z } from 'zod';
 export const sha256 = z.string().regex(/^[a-f0-9]{64}$/);
 export const archiveDigest = z.string().regex(/^sha256:[a-f0-9]{64}$/);
 export const commitSha = z.string().regex(/^[a-f0-9]{40}$/);
+export const executableName = z.string().regex(/^[\p{L}\p{M}\p{N}_.-][\p{L}\p{M}\p{N} _.-]*$/u)
+  .refine(value => value !== '.' && value !== '..' && value === value.normalize('NFC') && new TextEncoder().encode(value).length <= 255);
+export const bundleName = executableName.refine(value => /^[\p{L}\p{N}][\p{L}\p{M}\p{N} _.-]*\.app$/u.test(value));
 export const stageSchema = z.enum(['sign', 'finalize', 'dmg_sign', 'dmg_finalize']);
 export const sourceMetadataSchema = z.object({
   source_sha: commitSha,
@@ -23,7 +26,7 @@ export const manifestSchema = z.object({
   policy_digest: archiveDigest,
   team_id: z.string().regex(/^[A-Z0-9]{10}$/),
   bundle_id: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9.-]{0,254}$/),
-  bundle_name: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9 _.-]{0,90}\.app$/),
+  bundle_name: bundleName,
   architecture: z.enum(['arm64', 'x64', 'universal']),
   profile: z.enum(['native', 'electron']),
   harden_electron_fuses: z.boolean().default(false),

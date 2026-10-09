@@ -7,7 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
-import { credentialsSchema, manifestSchema, sourceMetadataSchema, verificationSchema } from './contract.mjs';
+import { credentialsSchema, executableName, manifestSchema, sourceMetadataSchema, verificationSchema } from './contract.mjs';
 
 delete process.env.DEBUG;
 const require = createRequire(import.meta.url);
@@ -122,7 +122,7 @@ async function inspectBundle(appPath, manifest, temporary, requireSignatures, re
   if (info.CFBundleIdentifier !== manifest.bundle_id || info.CFBundleShortVersionString !== manifest.version) {
     throw new Error('application identity mismatch');
   }
-  if (typeof info.CFBundleExecutable !== 'string' || !/^[A-Za-z0-9._-]{1,255}$/.test(info.CFBundleExecutable)) {
+  if (!executableName.safeParse(info.CFBundleExecutable).success) {
     throw new Error('invalid application executable');
   }
   const executable = path.join(appPath, 'Contents', 'MacOS', info.CFBundleExecutable);
@@ -139,7 +139,15 @@ async function inspectBundle(appPath, manifest, temporary, requireSignatures, re
 
   let asarVerified = false;
   if (manifest.profile === 'electron') {
-    const fuse = await getCurrentFuseWire(executable);
+    const fuseFiles = [];
+    if (manifest.architecture === 'universal') {
+      const framework = path.join(appPath, 'Contents', 'Frameworks', 'Electron Framework.framework', 'Electron Framework');
+      for (const arch of wanted) {
+        const slice = path.join(temporary, `electron-${arch}`);
+        await command('/usr/bin/lipo', [framework, '-thin', arch, '-output', slice]);
+        fuseFiles.push(slice);
+      }
+    } else fuseFiles.push(executable);
     const required = [
       [FuseV1Options.RunAsNode, FuseState.DISABLE],
       [FuseV1Options.EnableNodeOptionsEnvironmentVariable, FuseState.DISABLE],
@@ -147,7 +155,14 @@ async function inspectBundle(appPath, manifest, temporary, requireSignatures, re
       [FuseV1Options.EnableEmbeddedAsarIntegrityValidation, FuseState.ENABLE],
       [FuseV1Options.OnlyLoadAppFromAsar, FuseState.ENABLE],
     ];
-    if (requireFuses && required.some(([index, state]) => fuse[index] !== state)) throw new Error('application security policy mismatch');
+    try {
+      for (const file of fuseFiles) {
+        const fuse = await getCurrentFuseWire(file);
+        if (requireFuses && (fuse.version !== FuseVersion.V1 || required.some(([index, state]) => fuse[index] !== state))) throw new Error('application security policy mismatch');
+      }
+    } finally {
+      if (manifest.architecture === 'universal') await Promise.all(fuseFiles.map(file => rm(file, { force: true })));
+    }
     const asarPath = path.join(appPath, 'Contents', 'Resources', 'app.asar');
     const asarStat = await lstat(asarPath);
     if (!asarStat.isFile() || asarStat.isSymbolicLink() || asarStat.size > manifest.max_unpacked_bytes) throw new Error('invalid application archive');
