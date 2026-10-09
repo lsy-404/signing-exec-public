@@ -1,3 +1,4 @@
+import { getIDToken } from '@actions/core';
 import { createHash } from 'node:crypto';
 import { createReadStream, createWriteStream } from 'node:fs';
 import { chmod, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
@@ -38,19 +39,9 @@ export function validateRoute(action) {
   return `${API_ORIGIN}/runner/v1/requests`;
 }
 
-async function getOidcToken(fetchImpl, visibility) {
-  const rawUrl = process.env.ACTIONS_ID_TOKEN_REQUEST_URL;
-  const requestToken = process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
-  let endpoint;
-  try { endpoint = new URL(rawUrl); } catch { throw new ClientError('OIDC_UNAVAILABLE'); }
-  if (endpoint.protocol !== 'https:' || endpoint.hostname !== 'pipelines.actions.githubusercontent.com' || endpoint.username || endpoint.password || endpoint.hash || !requestToken) throw new ClientError('OIDC_UNAVAILABLE');
-  if (visibility !== 'public' && visibility !== 'private') throw new ClientError('INVALID_INPUT');
-  endpoint.searchParams.set('audience', `${API_ORIGIN}/runner/${visibility}`);
-  const response = await fetchImpl(endpoint, { headers: { authorization: `Bearer ${requestToken}` }, redirect: 'error' });
-  if (!response.ok) throw new ClientError('OIDC_UNAVAILABLE');
-  const data = await parseJson(response);
-  if (typeof data.value !== 'string' || !data.value) throw new ClientError('OIDC_UNAVAILABLE');
-  return data.value;
+async function getOidcToken(audience) {
+  try { return await getIDToken(audience); }
+  catch { throw new ClientError('OIDC_UNAVAILABLE'); }
 }
 
 async function parseJson(response) {
@@ -78,10 +69,11 @@ function validateActionResult(action, body) {
   return body;
 }
 
-export function createApi({ fetchImpl = fetch } = {}) {
+export function createApi({ fetchImpl = fetch, tokenProvider = getOidcToken } = {}) {
   return async (action, input, extra = {}) => {
     validateRoute(action);
-    const token = await getOidcToken(fetchImpl, input.visibility);
+    if (!['public','private'].includes(input.visibility)) throw new ClientError('INVALID_INPUT');
+    const token = await tokenProvider(`${API_ORIGIN}/runner/${input.visibility}`);
     const url = `${API_ORIGIN}/runner/v1/requests/${encodeURIComponent(input.requestId)}/${action}`;
     const response = await fetchImpl(url, {
       method: 'POST', redirect: 'error',
