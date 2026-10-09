@@ -50,7 +50,7 @@ def inspect_product(archive_path, bundle_name, maximum):
     ancestors = set()
     nondirectories = set()
     spellings = {}
-    with zipfile.ZipFile(archive_path) as archive:
+    with zipfile.ZipFile(archive_path, metadata_encoding='utf-8') as archive:
         items = archive.infolist()
         if not items or len(items) > MAX_ENTRIES:
             fail()
