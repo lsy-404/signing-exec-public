@@ -90,7 +90,10 @@ export function createApi({ fetchImpl = fetch } = {}) {
     });
     if (action === 'complete') {
       if (response.status !== 202) throw new ClientError('API_REQUEST_FAILED');
-    } else if (!response.ok) throw new ClientError('API_REQUEST_FAILED');
+    } else if (!response.ok) {
+      const detail = await parseJson(response).catch(() => null);
+      throw new ClientError(typeof detail?.error === 'string' && /^[a-z_]{1,64}$/.test(detail.error) ? `API_${detail.error.toUpperCase()}` : 'API_REQUEST_FAILED');
+    }
     return validateActionResult(action, await parseJson(response));
   };
 }
@@ -281,7 +284,8 @@ export async function main(args = process.argv.slice(2)) {
     else if (args[0] === 'cleanup') await cleanup();
     else throw new ClientError('INVALID_COMMAND');
   } catch (error) {
-    const code = error instanceof ClientError ? error.code : 'CLIENT_FAILED';
+    const native = error instanceof Error && /^(?:macOS signing operation failed: [a-z_]{1,64}|disk image operation failed: [a-z-]{1,64}|disk image cleanup failed)$/.test(error.message);
+    const code = error instanceof ClientError ? error.code : native ? error.message : 'CLIENT_FAILED';
     process.stderr.write(`${code}\n`);
     process.exitCode = 1;
   }
