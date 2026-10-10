@@ -88,21 +88,36 @@ function identityHeaders(invocation, runnerToken) {
   };
 }
 
-export function createApi({ fetchImpl = fetch, runnerToken = process.env.SIGNING_RUNNER_TOKEN } = {}) {
+const RETRIED_ACTIONS = new Set(['output', 'complete']);
+
+export function createApi({ fetchImpl = fetch, runnerToken = process.env.SIGNING_RUNNER_TOKEN, sleep = defaultSleep } = {}) {
   if (!RUNNER_TOKEN_RE.test(runnerToken ?? '')) throw new ClientError('RUNNER_TOKEN_UNAVAILABLE');
-  return async (action, input, extra = {}) => {
-    validateRoute(action);
-    const invocation = validateInvocation(input);
+  const attempt = async (action, input, invocation, extra) => {
     const url = `${API_ORIGIN}/runner/v1/requests/${encodeURIComponent(input.requestId)}/${action}`;
     const response = await fetchImpl(url, {
       method: 'POST', redirect: 'error',
       headers: { authorization: `Bearer ${runnerToken}`, 'content-type': 'application/json', accept: 'application/json' },
       body: JSON.stringify({ ...extra, generation: invocation.generation, nonce: invocation.nonce, run_id: invocation.runId, run_attempt: invocation.runAttempt }),
+      ...(RETRIED_ACTIONS.has(action) ? { signal: AbortSignal.timeout(PART_TIMEOUT_MS) } : {}),
     });
     if (action === 'complete') {
       if (response.status !== 202) throw await apiFailure(response);
     } else if (!response.ok) throw await apiFailure(response);
     return validateActionResult(action, await parseJson(response));
+  };
+  return async (action, input, extra = {}) => {
+    validateRoute(action);
+    const invocation = validateInvocation(input);
+    if (!RETRIED_ACTIONS.has(action)) return attempt(action, input, invocation, extra);
+    // The center answers these idempotently, so a lost response can be asked for again.
+    for (let tries = 1; ; tries += 1) {
+      try { return await attempt(action, input, invocation, extra); }
+      catch (error) {
+        if (error instanceof ClientError && !transientStatus(error.status)) throw error;
+        if (tries >= MAX_ATTEMPTS) throw error instanceof ClientError ? error : new ClientError('API_REQUEST_FAILED');
+        await sleep(BACKOFF_MS[tries - 1]);
+      }
+    }
   };
 }
 
@@ -268,7 +283,7 @@ async function validateOutput(outputDir, manifest, verificationSchema) {
 export async function execute({ input = process.env, fetchImpl = fetch, sleep = defaultSleep } = {}) {
   const { credentialsSchema, manifestSchema, verificationSchema } = await import('./contract.mjs');
   const invocation = invocationFromEnvironment(input);
-  const api = createApi({ fetchImpl, runnerToken: input.SIGNING_RUNNER_TOKEN });
+  const api = createApi({ fetchImpl, runnerToken: input.SIGNING_RUNNER_TOKEN, sleep });
   const work = await makeRunDir(invocation);
   const inputZip = path.join(work, 'input.zip');
   const outputDir = path.join(work, 'output');
