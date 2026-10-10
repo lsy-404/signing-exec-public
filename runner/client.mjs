@@ -1,23 +1,33 @@
 import { createHash } from 'node:crypto';
-import { createReadStream, createWriteStream } from 'node:fs';
-import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { createReadStream } from 'node:fs';
+import { chmod, mkdir, mkdtemp, open, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { pipeline } from 'node:stream/promises';
-import { Transform } from 'node:stream';
+import { promisify } from 'node:util';
 
+const execFileAsync = promisify(execFile);
 const API_ORIGIN = 'https://sign.voidcarve.com';
 const MAX_JSON_BYTES = 1_000_000;
 const ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const NONCE_RE = /^[A-Za-z0-9_-]{43}$/;
 const RUNNER_TOKEN_RE = /^vcr_[A-Za-z0-9_-]{43}$/;
 const DIGEST_RE = /^sha256:[a-f0-9]{64}$/;
-const ARTIFACT_HOSTS = [/^productionresultssa\d+\.blob\.core\.windows\.net$/, /^pipelines\.actions\.githubusercontent\.com$/, /^results-receiver\.actions\.githubusercontent\.com$/];
+const MIN_PART_BYTES = 5 * 1024 * 1024;
+const MAX_PART_BYTES = 64 * 1024 * 1024;
+const MAX_PARTS = 10_000;
+const MAX_ATTEMPTS = 5;
+const BACKOFF_MS = [2000, 4000, 8000, 16000];
+const PART_TIMEOUT_MS = 300_000;
+const ZIP = '/usr/bin/zip';
 const SAFE_OUTPUTS = new Set(['signed.tar.gz', 'product.zip', 'signed.dmg', 'product.dmg']);
 
 export class ClientError extends Error {
-  constructor(code) { super(code); this.code = code; }
+  constructor(code, status = 0) { super(code); this.code = code; this.status = status; }
 }
+
+const transientStatus = status => status >= 500 || status === 408 || status === 429;
+const defaultSleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 export function validateInvocation(input) {
   if (!input || !ID_RE.test(input.requestId ?? '') || !/^[1-9]\d*$/.test(input.generation ?? '') || !NONCE_RE.test(input.nonce ?? '')) throw new ClientError('INVALID_INPUT');
@@ -28,15 +38,8 @@ export function validateInvocation(input) {
   return { requestId: input.requestId, generation, nonce: input.nonce, visibility: input.visibility, runId, runAttempt: 1 };
 }
 
-export function validateArtifactUrl(value) {
-  let url;
-  try { url = new URL(value); } catch { throw new ClientError('INVALID_DOWNLOAD_URL'); }
-  if (url.protocol !== 'https:' || url.port && url.port !== '443' || url.username || url.password || url.hash || !ARTIFACT_HOSTS.some(pattern => pattern.test(url.hostname))) throw new ClientError('INVALID_DOWNLOAD_URL');
-  return url;
-}
-
 export function validateRoute(action) {
-  if (!['claim', 'input', 'authorize-sign', 'heartbeat', 'complete'].includes(action)) throw new ClientError('INVALID_ROUTE');
+  if (!['claim', 'heartbeat', 'download', 'authorize-sign', 'output', 'complete'].includes(action)) throw new ClientError('INVALID_ROUTE');
   return `${API_ORIGIN}/runner/v1/requests`;
 }
 
@@ -58,11 +61,31 @@ async function parseJson(response) {
 function validateActionResult(action, body) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) throw new ClientError('INVALID_RESPONSE');
   if (action === 'claim' && !body.manifest) throw new ClientError('INVALID_RESPONSE');
-  if (action === 'input' && (!DIGEST_RE.test(body.digest ?? '') || !Number.isSafeInteger(body.max_bytes) || body.max_bytes < 1 || body.max_bytes > 2_000_000_000 || typeof body.download_url !== 'string')) throw new ClientError('INVALID_RESPONSE');
+  if (action === 'output') {
+    const parts = body.received_parts;
+    if (!Number.isSafeInteger(body.part_size) || body.part_size < MIN_PART_BYTES || body.part_size > MAX_PART_BYTES
+      || !Number.isSafeInteger(body.part_count) || body.part_count < 1 || body.part_count > MAX_PARTS
+      || !Array.isArray(parts) || parts.some(part => !Number.isSafeInteger(part) || part < 1 || part > body.part_count)) throw new ClientError('INVALID_RESPONSE');
+  }
   if (action === 'authorize-sign' && (typeof body.operation_id !== 'string' || !/^[A-Za-z0-9_:-]{16,128}$/.test(body.operation_id))) throw new ClientError('INVALID_RESPONSE');
   if (action === 'heartbeat' && (!Number.isSafeInteger(body.lease_until) || body.lease_until <= Date.now())) throw new ClientError('INVALID_RESPONSE');
   if (action === 'complete' && body.state !== 'verifying') throw new ClientError('INVALID_RESPONSE');
   return body;
+}
+
+async function apiFailure(response) {
+  const detail = await parseJson(response).catch(() => null);
+  return new ClientError(typeof detail?.error === 'string' && /^[a-z_]{1,64}$/.test(detail.error) ? `API_${detail.error.toUpperCase()}` : 'API_REQUEST_FAILED', response.status);
+}
+
+function identityHeaders(invocation, runnerToken) {
+  return {
+    authorization: `Bearer ${runnerToken}`,
+    'x-signing-generation': String(invocation.generation),
+    'x-signing-nonce': invocation.nonce,
+    'x-signing-run-id': String(invocation.runId),
+    'x-signing-run-attempt': String(invocation.runAttempt),
+  };
 }
 
 export function createApi({ fetchImpl = fetch, runnerToken = process.env.SIGNING_RUNNER_TOKEN } = {}) {
@@ -77,39 +100,123 @@ export function createApi({ fetchImpl = fetch, runnerToken = process.env.SIGNING
       body: JSON.stringify({ ...extra, generation: invocation.generation, nonce: invocation.nonce, run_id: invocation.runId, run_attempt: invocation.runAttempt }),
     });
     if (action === 'complete') {
-      if (response.status !== 202) throw new ClientError('API_REQUEST_FAILED');
-    } else if (!response.ok) {
-      const detail = await parseJson(response).catch(() => null);
-      throw new ClientError(typeof detail?.error === 'string' && /^[a-z_]{1,64}$/.test(detail.error) ? `API_${detail.error.toUpperCase()}` : 'API_REQUEST_FAILED');
-    }
+      if (response.status !== 202) throw await apiFailure(response);
+    } else if (!response.ok) throw await apiFailure(response);
     return validateActionResult(action, await parseJson(response));
   };
 }
 
-export async function downloadVerified(urlValue, destination, { digest, maxBytes, fetchImpl = fetch }) {
-  const url = validateArtifactUrl(urlValue);
+function contentRangeStart(value) {
+  const match = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(value ?? '');
+  return match ? { start: Number(match[1]), total: Number(match[3]) } : null;
+}
+
+export async function downloadObject(invocation, object, destination, { digest, maxBytes, fetchImpl = fetch, runnerToken = process.env.SIGNING_RUNNER_TOKEN, sleep = defaultSleep }) {
+  validateRoute('download');
+  if (!RUNNER_TOKEN_RE.test(runnerToken ?? '')) throw new ClientError('RUNNER_TOKEN_UNAVAILABLE');
+  if (object !== 'input' && object !== 'template') throw new ClientError('INVALID_INPUT');
   if (!DIGEST_RE.test(digest ?? '') || !Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 2_000_000_000) throw new ClientError('INVALID_DOWNLOAD_METADATA');
-  const response = await fetchImpl(url, { redirect: 'error' });
-  if (!response.ok || !response.body) throw new ClientError('DOWNLOAD_FAILED');
-  const hasher = createHash('sha256');
-  let size = 0;
-  const meter = new Transform({ transform(chunk, _encoding, callback) {
-    size += chunk.length;
-    if (size > maxBytes) return callback(new ClientError('DOWNLOAD_TOO_LARGE'));
-    hasher.update(chunk);
-    callback(null, chunk);
-  } });
+  const url = `${API_ORIGIN}/runner/v1/requests/${encodeURIComponent(invocation.requestId)}/download`;
+  const body = JSON.stringify({ generation: invocation.generation, nonce: invocation.nonce, run_id: invocation.runId, run_attempt: invocation.runAttempt, object });
+  const handle = await open(destination, 'wx', 0o600);
+  let hasher = createHash('sha256');
+  let written = 0;
+  let total = 0;
   try {
-    await pipeline(response.body, meter, createWriteStream(destination, { flags: 'wx', mode: 0o600 }));
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        const headers = { authorization: `Bearer ${runnerToken}`, 'content-type': 'application/json' };
+        if (written > 0) headers.range = `bytes=${written}-`;
+        const response = await fetchImpl(url, { method: 'POST', redirect: 'error', headers, body });
+        if (response.status >= 300 && response.status < 400) throw new ClientError('DOWNLOAD_FAILED');
+        if (!response.ok) {
+          if (transientStatus(response.status)) throw new Error('transient');
+          throw await apiFailure(response);
+        }
+        if (!response.body) throw new Error('transient');
+        const length = Number(response.headers.get('content-length') ?? NaN);
+        if (response.status === 206) {
+          const range = contentRangeStart(response.headers.get('content-range'));
+          if (!range || range.start !== written || written === 0) throw new ClientError('DOWNLOAD_FAILED');
+          total = range.total;
+        } else if (response.status === 200) {
+          if (!Number.isSafeInteger(length)) throw new ClientError('DOWNLOAD_FAILED');
+          if (written > 0) { await handle.truncate(0); hasher = createHash('sha256'); written = 0; }
+          total = length;
+        } else throw new ClientError('DOWNLOAD_FAILED');
+        if (total < 1 || total > maxBytes) throw new ClientError('DOWNLOAD_TOO_LARGE');
+        for await (const chunk of response.body) {
+          if (written + chunk.length > total) throw new ClientError('DOWNLOAD_TOO_LARGE');
+          await handle.write(chunk, 0, chunk.length, written);
+          hasher.update(chunk);
+          written += chunk.length;
+        }
+        if (written !== total) throw new Error('transient');
+        break;
+      } catch (error) {
+        if (error instanceof ClientError && !transientStatus(error.status)) throw error;
+        if (attempt >= MAX_ATTEMPTS) throw new ClientError('DOWNLOAD_FAILED');
+        await sleep(BACKOFF_MS[attempt - 1]);
+      }
+    }
   } catch (error) {
+    await handle.close();
     await rm(destination, { force: true });
     throw error instanceof ClientError ? error : new ClientError('DOWNLOAD_FAILED');
   }
+  await handle.close();
   if (`sha256:${hasher.digest('hex')}` !== digest) {
     await rm(destination, { force: true });
     throw new ClientError('DOWNLOAD_DIGEST_MISMATCH');
   }
-  return { size };
+  return { size: written };
+}
+
+export async function bundleOutput(outputDir, verification, work, maxBytes) {
+  const bundle = path.join(work, 'output.zip');
+  const payload = path.join(outputDir, verification.files[0].path);
+  await execFileAsync(ZIP, ['-q', '-X', '-j', '-0', bundle, payload, path.join(outputDir, 'verification.json')]);
+  const info = await stat(bundle);
+  if (!info.isFile() || info.size < 1 || info.size > maxBytes) throw new ClientError('INVALID_OUTPUT');
+  const hasher = createHash('sha256');
+  for await (const chunk of createReadStream(bundle)) hasher.update(chunk);
+  return { path: bundle, size: info.size, digest: `sha256:${hasher.digest('hex')}` };
+}
+
+async function putPart(invocation, bundle, part, partSize, { fetchImpl, runnerToken }) {
+  const start = (part - 1) * partSize;
+  const end = Math.min(bundle.size, start + partSize) - 1;
+  const response = await fetchImpl(`${API_ORIGIN}/runner/v1/requests/${encodeURIComponent(invocation.requestId)}/output/parts/${part}`, {
+    method: 'PUT', redirect: 'error', duplex: 'half', signal: AbortSignal.timeout(PART_TIMEOUT_MS),
+    headers: { ...identityHeaders(invocation, runnerToken), 'content-type': 'application/octet-stream', 'content-length': String(end - start + 1) },
+    body: createReadStream(bundle.path, { start, end }),
+  });
+  if (!response.ok) throw await apiFailure(response);
+  await response.body?.cancel();
+}
+
+export async function uploadOutput(invocation, bundle, { api, fetchImpl = fetch, runnerToken = process.env.SIGNING_RUNNER_TOKEN, sleep = defaultSleep }) {
+  if (!RUNNER_TOKEN_RE.test(runnerToken ?? '')) throw new ClientError('RUNNER_TOKEN_UNAVAILABLE');
+  const begin = () => api('output', invocation, { archive_digest: bundle.digest, archive_size: bundle.size });
+  let session = await begin();
+  if (session.part_count !== Math.ceil(bundle.size / session.part_size)) throw new ClientError('INVALID_RESPONSE');
+  for (let part = 1; part <= session.part_count; part += 1) {
+    if (session.received_parts.includes(part)) continue;
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        await putPart(invocation, bundle, part, session.part_size, { fetchImpl, runnerToken });
+        break;
+      } catch (error) {
+        if (error instanceof ClientError && error.status && !transientStatus(error.status)) throw error;
+        if (attempt >= MAX_ATTEMPTS) throw error instanceof ClientError ? error : new ClientError('UPLOAD_FAILED');
+        await sleep(BACKOFF_MS[attempt - 1]);
+        const refreshed = await begin();
+        if (refreshed.part_size !== session.part_size || refreshed.part_count !== session.part_count) throw new ClientError('INVALID_RESPONSE');
+        session = refreshed;
+        if (session.received_parts.includes(part)) break;
+      }
+    }
+  }
 }
 
 function stageFamily(stage) {
@@ -158,7 +265,7 @@ async function validateOutput(outputDir, manifest, verificationSchema) {
   return verification;
 }
 
-export async function execute({ input = process.env, fetchImpl = fetch } = {}) {
+export async function execute({ input = process.env, fetchImpl = fetch, sleep = defaultSleep } = {}) {
   const { credentialsSchema, manifestSchema, verificationSchema } = await import('./contract.mjs');
   const invocation = invocationFromEnvironment(input);
   const api = createApi({ fetchImpl, runnerToken: input.SIGNING_RUNNER_TOKEN });
@@ -184,15 +291,12 @@ export async function execute({ input = process.env, fetchImpl = fetch } = {}) {
     };
     timer = setInterval(() => { void pulse(); }, 120_000);
     timer.unref?.();
-    const inputInfo = await api('input', invocation);
-    if (inputInfo.digest !== manifest.input_digest) throw new ClientError('INVALID_RESPONSE');
-    if (manifest.stage === 'dmg_sign' && typeof inputInfo.template_download_url !== 'string') throw new ClientError('INVALID_RESPONSE');
-    await downloadVerified(inputInfo.download_url, inputZip, { digest: inputInfo.digest, maxBytes: inputInfo.max_bytes, fetchImpl });
+    const transfer = { fetchImpl, runnerToken: input.SIGNING_RUNNER_TOKEN, sleep };
+    await downloadObject(invocation, 'input', inputZip, { digest: manifest.input_digest, maxBytes: manifest.max_artifact_bytes, ...transfer });
     let templatePath;
     if (manifest.stage === 'dmg_sign') {
-      if (typeof inputInfo.template_download_url !== 'string' || !DIGEST_RE.test(inputInfo.template_digest ?? '')) throw new ClientError('INVALID_RESPONSE');
       templatePath = path.join(work, 'template.zip');
-      await downloadVerified(inputInfo.template_download_url, templatePath, { digest: inputInfo.template_digest, maxBytes: inputInfo.max_bytes, fetchImpl });
+      await downloadObject(invocation, 'template', templatePath, { digest: manifest.template_digest, maxBytes: manifest.max_artifact_bytes, ...transfer });
     }
     let credentialsProvider;
     if (stage.action === 'sign') {
@@ -218,9 +322,12 @@ export async function execute({ input = process.env, fetchImpl = fetch } = {}) {
     if (heartbeatError) throw new ClientError('HEARTBEAT_FAILED');
     const verification = await validateOutput(outputDir, manifest, verificationSchema);
     await chmod(outputDir, 0o700);
-    const reportPath = path.join(outputDir, 'verification.json');
-    await writeFile(reportPath, `${JSON.stringify(verification)}\n`, { mode: 0o600 });
-    return { workDir: work, outputDir, reportPath };
+    await writeFile(path.join(outputDir, 'verification.json'), `${JSON.stringify(verification)}\n`, { mode: 0o600 });
+    const bundle = await bundleOutput(outputDir, verification, work, manifest.max_artifact_bytes);
+    await uploadOutput(invocation, bundle, { api, fetchImpl, runnerToken: input.SIGNING_RUNNER_TOKEN, sleep });
+    if (heartbeatError) throw new ClientError('HEARTBEAT_FAILED');
+    await api('complete', invocation, { output_archive_digest: bundle.digest, output_archive_size: bundle.size, verification_report: verification });
+    return { workDir: work };
   } catch (error) {
     await rm(work, { recursive: true, force: true });
     throw error;
@@ -228,25 +335,6 @@ export async function execute({ input = process.env, fetchImpl = fetch } = {}) {
     if (timer) clearInterval(timer);
     if (heartbeatBusy && heartbeatDone) await heartbeatDone;
   }
-}
-
-export async function complete({ input = process.env, fetchImpl = fetch } = {}) {
-  const invocation = invocationFromEnvironment(input);
-  const outputArtifactId = Number(input.INPUT_ARTIFACT_ID);
-  const outputArchiveDigest = input.INPUT_ARTIFACT_DIGEST;
-  if (!Number.isSafeInteger(outputArtifactId) || outputArtifactId<1 || !DIGEST_RE.test(outputArchiveDigest ?? '')) throw new ClientError('INVALID_INPUT');
-  const workDir = path.resolve(input.INPUT_WORK_DIR ?? '');
-  const parent = tempRoot();
-  if (path.dirname(workDir) !== parent || !path.basename(workDir).startsWith('signing-client-')) throw new ClientError('INVALID_TEMP_DIR');
-  const marker = (await readFile(path.join(workDir, '.signing-run'), 'utf8')).split('\n');
-  if (marker[0] !== invocation.requestId || marker[1] !== String(invocation.generation)) throw new ClientError('INVALID_TEMP_DIR');
-  const reportPath = path.join(workDir, 'output', 'verification.json');
-  const { verificationSchema } = await import('./contract.mjs');
-  const verification = verificationSchema.parse(JSON.parse(await readFile(reportPath, 'utf8')));
-  if (verification.request_id !== invocation.requestId || verification.generation !== invocation.generation) throw new ClientError('INVALID_OUTPUT');
-  const api = createApi({ fetchImpl, runnerToken: input.SIGNING_RUNNER_TOKEN });
-  await api('complete', invocation, { output_artifact_id: outputArtifactId, output_archive_digest: outputArchiveDigest, verification_report: verification });
-  return { state: 'verifying' };
 }
 
 export async function cleanup({ input = process.env } = {}) {
@@ -270,10 +358,7 @@ export async function main(args = process.argv.slice(2)) {
     if (args[0] === 'execute') {
       const result = await execute();
       await setOutput('work_dir', result.workDir);
-      await setOutput('output_dir', result.outputDir);
-      await setOutput('report_path', result.reportPath);
-    } else if (args[0] === 'complete') await complete();
-    else if (args[0] === 'cleanup') await cleanup();
+    } else if (args[0] === 'cleanup') await cleanup();
     else throw new ClientError('INVALID_COMMAND');
   } catch (error) {
     const native = error instanceof Error && /^(?:macOS signing operation failed: [a-z_]{1,64}|disk image operation failed: [a-z-]{1,64}|disk image cleanup failed)$/.test(error.message);
