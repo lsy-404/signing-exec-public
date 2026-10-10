@@ -64,22 +64,6 @@ jobs:
         id: execute
         run: node runner/client.mjs execute
 
-      - name: Upload signed output
-        id: artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: signing-${{ inputs.request_id }}-${{ inputs.generation }}
-          path: ${{ steps.execute.outputs.output_dir }}/*
-          retention-days: 7
-          if-no-files-found: error
-
-      - name: Submit signed output receipt
-        env:
-          INPUT_ARTIFACT_ID: ${{ steps.artifact.outputs.artifact-id }}
-          INPUT_ARTIFACT_DIGEST: sha256:${{ steps.artifact.outputs.artifact-digest }}
-          INPUT_WORK_DIR: ${{ steps.execute.outputs.work_dir }}
-        run: node runner/client.mjs complete
-
       - name: Clean up this request
         if: always() && steps.execute.outputs.work_dir != ''
         env:
