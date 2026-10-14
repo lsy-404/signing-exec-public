@@ -21,6 +21,13 @@ class RunnerFailure extends Error {
     this.code = code;
   }
 }
+class CommandFailure extends Error {
+  constructor(exitCode, transient = false) {
+    super('native signing command failed');
+    this.exitCode = exitCode;
+    this.transient = transient;
+  }
+}
 function sha256(data) {
   return createHash('sha256').update(data).digest('hex');
 }
@@ -65,7 +72,7 @@ async function snapshotArchive(source, destination, maxBytes, expectedDigest) {
 
 async function command(file, args, options = {}) {
   try {
-    const { timeout = 120_000, maxOutput = 8 * 1024 * 1024, ...spawnOptions } = options;
+    const { timeout = 120_000, maxOutput = 8 * 1024 * 1024, transientOutput, ...spawnOptions } = options;
     return await new Promise((resolve, reject) => {
       const child = spawn(file, args, { ...spawnOptions, timeout, stdio: ['ignore', 'pipe', 'pipe'] });
       const stdout = [];
@@ -83,14 +90,34 @@ async function command(file, args, options = {}) {
       };
       child.stdout.on('data', collect(stdout));
       child.stderr.on('data', collect(stderr));
-      child.once('error', () => reject(new Error('command failed')));
-      child.once('close', code => {
-        if (failed || code !== 0) return reject(new Error('command failed'));
+      child.once('error', () => reject(new CommandFailure(null)));
+      child.once('close', (code, signal) => {
+        if (failed || code !== 0) return reject(new CommandFailure(code, !failed && (signal === 'SIGTERM'
+          || Boolean(transientOutput?.test(Buffer.concat([...stdout, ...stderr]).toString('utf8'))))));
         resolve({ stdout: Buffer.concat(stdout).toString('utf8'), stderr: Buffer.concat(stderr).toString('utf8') });
       });
     });
-  } catch {
-    throw new Error('native signing command failed');
+  } catch (error) {
+    throw error instanceof CommandFailure ? error : new CommandFailure(null);
+  }
+}
+
+async function staple(target) {
+  const backoff = [5_000, 15_000, 45_000];
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await command('/usr/bin/xcrun', ['stapler', 'staple', target], {
+        timeout: 60_000,
+        transientOutput: /Record not found|timed? out|network connection|Could not connect|HTTP (?:429|5\d\d)/i,
+      });
+      return;
+    } catch (error) {
+      const transient = error instanceof CommandFailure && (error.transient || [68, 69, 75].includes(error.exitCode));
+      if (!transient || attempt === backoff.length) {
+        throw new RunnerFailure(Number.isInteger(error.exitCode) ? `stapling_exit_${error.exitCode}` : 'stapling_command_failed');
+      }
+      await new Promise(resolve => setTimeout(resolve, backoff[attempt]));
+    }
   }
 }
 
@@ -341,18 +368,7 @@ async function execute(manifestInput, inputArchivePath, outputDir, credentialsIn
     }
 
     failureCode = 'stapling';
-    const stapleAttempts = 3;
-    let stapled = false;
-    for (let attempt = 0; attempt < stapleAttempts; attempt++) {
-      try {
-        await command('/usr/bin/xcrun', ['stapler', 'staple', appPath], { timeout: 60_000 });
-        stapled = true;
-        break;
-      } catch {
-        if (attempt < stapleAttempts - 1) await new Promise(resolve => setTimeout(resolve, 1500 * (attempt + 1)));
-      }
-    }
-    if (!stapled) throw new Error('notarization ticket stapling failed');
+    await staple(appPath);
     failureCode = 'gatekeeper_verification';
     await command('/usr/bin/xcrun', ['stapler', 'validate', appPath], { timeout: 60_000 });
     await command('/usr/sbin/spctl', ['--assess', '--type', 'execute', '--verbose=2', appPath]);
@@ -394,4 +410,4 @@ export async function executeMacos(manifest, inputArchivePath, outputDir, creden
   }
 }
 
-export { command, createTar, fileSha256, identityHash, inspectBundle, keychainSearch, signingRequirement, snapshotArchive };
+export { command, createTar, fileSha256, identityHash, inspectBundle, keychainSearch, signingRequirement, snapshotArchive, staple };

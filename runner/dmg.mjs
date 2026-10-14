@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { credentialsSchema, manifestSchema, verificationSchema } from './contract.mjs';
-import { command, fileSha256, identityHash, inspectBundle, keychainSearch, signingRequirement, snapshotArchive } from './macos-sign.mjs';
+import { command, fileSha256, identityHash, inspectBundle, keychainSearch, signingRequirement, snapshotArchive, staple } from './macos-sign.mjs';
 
 async function unpack(mode, archive, target, manifest) {
   const script = fileURLToPath(new URL('./dmg-unpack.py',import.meta.url));
@@ -147,7 +147,7 @@ export async function executeDmg(rawManifest,inputArchivePath,outputDir,credenti
     if (await fileSha256(image)!==manifest.notary_archive_sha256) throw new Error('disk image notarization receipt mismatch');
     await verifyImage(image,manifest);
     phase = 'stapling';
-    await command('/usr/bin/xcrun',['stapler','staple',image]);
+    await staple(image);
     await command('/usr/bin/xcrun',['stapler','validate',image]);
     await verifyImage(image,manifest);
     await command('/usr/sbin/spctl',['--assess','--type','open','--context','context:primary-signature','--verbose=2',image]);
@@ -162,10 +162,11 @@ export async function executeDmg(rawManifest,inputArchivePath,outputDir,credenti
     await command('/usr/bin/hdiutil',['detach',attached]);
     attached = undefined;
     return await output(image,outputDir,manifest,asarVerified,manifest.notarization_id,manifest.notary_archive_sha256,true);
-  } catch {
+  } catch (error) {
     await rm(outputDir,{recursive:true,force:true});
     await mkdir(outputDir,{mode:0o700});
-    throw new Error(`disk image operation failed: ${phase}`);
+    const diagnostic = phase === 'stapling' && /^stapling_(?:exit_\d+|command_failed)$/.test(error?.code) ? error.code : phase;
+    throw new Error(`disk image operation failed: ${diagnostic}`);
   } finally {
     let failed = false;
     if (attached) try { await command('/usr/bin/hdiutil',['detach',attached]); } catch { failed = true; }
