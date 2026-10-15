@@ -17,11 +17,29 @@ const TIMESTAMP_URL = 'http://timestamp.acs.microsoft.com';
 const SIGNABLE_EXTENSIONS = new Set(['.exe', '.dll', '.node']);
 const REPOSITORY_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const POWERSHELL = 'pwsh.exe';
+const SAFE_AUTHORIZATION_CODES = new Set(['CREDENTIALS_ALREADY_REQUESTED', 'HEARTBEAT_FAILED', 'INVALID_RESPONSE']);
 
 class RunnerFailure extends Error {
-  constructor(code) {
+  constructor(code, diagnostic = null) {
     super(code);
     this.code = code;
+    this.diagnostic = diagnostic;
+  }
+}
+
+class TrustedCommandFailure extends Error {
+  constructor(diagnostic) {
+    super('trusted command failed');
+    this.diagnostic = diagnostic;
+  }
+}
+
+class PowerShellFailure extends Error {
+  constructor(scope, mode, diagnostic) {
+    super('trusted PowerShell command failed');
+    this.scope = scope;
+    this.mode = mode;
+    this.diagnostic = diagnostic;
   }
 }
 
@@ -47,12 +65,63 @@ async function run(file, args, { timeout = 300_000, maxOutput = 8 * 1024 * 1024,
     };
     child.stdout.on('data', collect(stdout));
     child.stderr.on('data', collect(stderr));
-    child.once('error', () => reject(new Error('trusted command unavailable')));
+    child.once('error', () => reject(new TrustedCommandFailure('process_unavailable')));
     child.once('close', code => {
-      if (overflow || code !== 0) return reject(new Error('trusted command failed'));
-      resolve({ stdout: Buffer.concat(stdout).toString('utf8'), stderr: Buffer.concat(stderr).toString('utf8') });
+      if (overflow) return reject(new TrustedCommandFailure('output_limit'));
+      const output = {
+        stdout: Buffer.concat(stdout).toString('utf8'),
+        stderr: Buffer.concat(stderr).toString('utf8'),
+      };
+      if (code !== 0) return reject(new TrustedCommandFailure(powerShellDiagnostic(output, code)));
+      resolve(output);
     });
   });
+}
+
+function powerShellDiagnostic(output, exitCode) {
+  const text = `${output.stderr}\n${output.stdout}`;
+  const aadsts = /\bAADSTS(\d{5,9})\b/i.exec(text);
+  if (aadsts) return `aadsts_${aadsts[1]}`;
+  const hresult = /\b(0x[0-9a-f]{8})\b/i.exec(text);
+  if (hresult) return `hresult_${hresult[1].toLowerCase()}`;
+  const status = /\b(?:Status|StatusCode)\s*[:=]?\s*([45]\d{2})\b/i.exec(text);
+  if (status) return `http_status_${status[1]}`;
+  const trustedErrors = [
+    ['missing product version', 'ps_product_version_missing'],
+    ['invalid Authenticode signature', 'ps_authenticode_invalid'],
+    ['missing Authenticode signer', 'ps_signer_missing'],
+    ['unexpected Authenticode subject', 'ps_subject_unexpected'],
+    ['missing trusted timestamp', 'ps_timestamp_missing'],
+    ['signing path outside approved roots', 'ps_path_outside_root'],
+    ['inspection path outside application directory', 'ps_inspection_outside_app'],
+    ['signing directory outside application root', 'ps_directory_outside_app'],
+    ['signing directory missing', 'ps_directory_missing'],
+    ['signable file missing', 'ps_file_missing'],
+    ['unsupported Authenticode file type', 'ps_file_type_unsupported'],
+    ['pinned Artifact Signing module unavailable', 'ps_module_missing'],
+    ['Artifact Signing command unavailable', 'ps_command_missing'],
+    ['No files were found to sign', 'ps_no_files_to_sign'],
+    ["The 'dotnet' command was not found on PATH", 'ps_dotnet8_missing'],
+    ['The .NET 8 runtime (Microsoft.NETCore.App 8.x) is required', 'ps_dotnet8_missing'],
+  ];
+  const trusted = trustedErrors.find(([message]) => text.toLowerCase().includes(message.toLowerCase()));
+  if (trusted) return trusted[1];
+  const signTool = /\bSignTool failed with exit code\s+(\d{1,3})\b/i.exec(text);
+  if (signTool && Number(signTool[1]) <= 255) return `signtool_exit_${Number(signTool[1])}`;
+  const signCli = /\bSignCli failed with exit code\s+(\d{1,3})\b/i.exec(text);
+  if (signCli && Number(signCli[1]) <= 255) return `signcli_exit_${Number(signCli[1])}`;
+  if (Number.isInteger(exitCode) && exitCode >= 0 && exitCode <= 255) return `powershell_exit_${exitCode}`;
+  return 'powershell_failed';
+}
+
+function isSafePowerShellDiagnostic(value) {
+  return /^(?:aadsts_\d{5,9}|hresult_0x[0-9a-f]{8}|http_status_[45]\d{2}|ps_(?:product_version_missing|authenticode_invalid|signer_missing|subject_unexpected|timestamp_missing|path_outside_root|inspection_outside_app|directory_outside_app|directory_missing|file_missing|file_type_unsupported|module_missing|command_missing|no_files_to_sign|dotnet8_missing)|signtool_exit_(?:0|[1-9]\d?|1\d{2}|2[0-4]\d|25[0-5])|signcli_exit_(?:0|[1-9]\d?|1\d{2}|2[0-4]\d|25[0-5])|powershell_exit_(?:0|[1-9]\d?|1\d{2}|2[0-4]\d|25[0-5])|powershell_failed|process_unavailable|output_limit|response_invalid)$/.test(value);
+}
+
+function safeAuthorizationCode(error) {
+  const code = error && typeof error.code === 'string' ? error.code : '';
+  if (/^API_[A-Z_]{1,64}$/.test(code) || SAFE_AUTHORIZATION_CODES.has(code)) return code;
+  return null;
 }
 
 function contained(root, target) {
@@ -252,10 +321,16 @@ async function readJsonOutput(result) {
   return JSON.parse(candidates.at(-1));
 }
 
-async function invokePowerShell(script, mode, configPath, filePath) {
-  const result = await run(POWERSHELL, ['-NoLogo', '-NoProfile', '-NonInteractive', '-File', script, '-Mode', mode, '-ConfigPath', configPath, '-FilePath', filePath]);
-  if (mode === 'SignFolder') return {};
-  return readJsonOutput(result);
+async function invokePowerShell(script, mode, configPath, filePath, scope) {
+  if (!['app', 'nsis', 'squirrel'].includes(scope)) throw new Error('invalid trusted signing scope');
+  try {
+    const result = await run(POWERSHELL, ['-NoLogo', '-NoProfile', '-NonInteractive', '-File', script, '-Mode', mode, '-ConfigPath', configPath, '-FilePath', filePath]);
+    if (mode === 'SignFolder') return {};
+    return readJsonOutput(result);
+  } catch (error) {
+    const diagnostic = error instanceof TrustedCommandFailure ? error.diagnostic : 'response_invalid';
+    throw new PowerShellFailure(scope, mode, diagnostic);
+  }
 }
 
 async function copyOutput(source, output, name, maxBytes) {
@@ -271,7 +346,8 @@ function trustedHookSource(script, config, failureMarker) {
   const scriptArg = JSON.stringify(script);
   const configArg = JSON.stringify(config);
   const markerArg = JSON.stringify(failureMarker);
-  return `const { spawnSync } = require('node:child_process');\nconst { writeFileSync } = require('node:fs');\nmodule.exports = function(file) {\n  try {\n    const base = ['-NoLogo','-NoProfile','-NonInteractive','-File',${scriptArg},'-ConfigPath',${configArg},'-FilePath',file];\n    const verify = spawnSync('pwsh.exe', [...base.slice(0, 5), '-Mode', 'Verify', ...base.slice(5)], { stdio: 'inherit', windowsHide: true, timeout: 300000 });\n    if (!verify.error && verify.status === 0) return;\n    const sign = spawnSync('pwsh.exe', [...base.slice(0, 5), '-Mode', 'Sign', ...base.slice(5)], { stdio: 'inherit', windowsHide: true, timeout: 300000 });\n    if (sign.error || sign.status !== 0) throw new Error('Windows signature verification failed');\n  } catch (error) {\n    try { writeFileSync(${markerArg}, 'failed', { flag: 'wx' }); } catch {}\n    throw error;\n  }\n};\n`;
+  const diagnosticSource = `const powerShellDiagnostic=${powerShellDiagnostic.toString()};\n`;
+  return `const { spawnSync } = require('node:child_process');\nconst { writeFileSync } = require('node:fs');\n${diagnosticSource}module.exports = function(file) {\n  const base = ['-NoLogo','-NoProfile','-NonInteractive','-File',${scriptArg},'-ConfigPath',${configArg},'-FilePath',file];\n  const options = { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, stdio: ['ignore','pipe','pipe'], windowsHide: true, timeout: 300000 };\n  const fail = diagnostic => { try { writeFileSync(${markerArg}, 'Sign:' + diagnostic, { flag: 'wx' }); } catch { throw 'Windows signature operation failed'; } };\n  try {\n    const verify = spawnSync('pwsh.exe', [...base.slice(0, 5), '-Mode', 'Verify', ...base.slice(5)], options);\n    if (!verify.error && verify.status === 0) return;\n    const sign = spawnSync('pwsh.exe', [...base.slice(0, 5), '-Mode', 'Sign', ...base.slice(5)], options);\n    if (sign.error || sign.status !== 0) {\n      fail(sign.error ? 'process_unavailable' : powerShellDiagnostic(sign, sign.status));\n    }\n  } catch {\n    fail('powershell_failed');\n  }\n};\n`;
 }
 
 async function prepareSquirrelVendor(work, installerModule) {
@@ -358,13 +434,13 @@ async function signNsis(manifest, appDir, work, output, signOne, signScript, con
     },
   });
   const products = ['product.exe', ...(manifest.windows.portable ? ['product-portable.exe'] : [])];
-  for (const filename of products) await invokePowerShell(signScript, 'Verify', configPath, path.join(buildDir, filename));
+  for (const filename of products) await invokePowerShell(signScript, 'Verify', configPath, path.join(buildDir, filename), 'nsis');
   for (const filename of products) {
     const source = path.join(buildDir, filename);
     await copyOutput(source, output, filename, manifest.max_artifact_bytes);
   }
   const originalAppFiles = await walkSignableFiles(appDir);
-  for (const file of originalAppFiles) await invokePowerShell(signScript, 'Verify', configPath, file);
+  for (const file of originalAppFiles) await invokePowerShell(signScript, 'Verify', configPath, file, 'app');
 }
 
 async function signSquirrel(manifest, appDir, work, output, signScript, configPath) {
@@ -380,8 +456,8 @@ async function signSquirrel(manifest, appDir, work, output, signScript, configPa
   const installerModule = path.join(REPOSITORY_ROOT, 'runner', 'node_modules', 'electron-winstaller', 'lib', 'index.js');
   const vendorDirectory = await prepareSquirrelVendor(work, installerModule);
   const squirrelExecutable = path.join(vendorDirectory, 'Squirrel.exe');
-  await invokePowerShell(signScript, 'Sign', configPath, squirrelExecutable);
-  await invokePowerShell(signScript, 'Verify', configPath, squirrelExecutable);
+  await invokePowerShell(signScript, 'Sign', configPath, squirrelExecutable, 'squirrel');
+  await invokePowerShell(signScript, 'Verify', configPath, squirrelExecutable, 'squirrel');
   const previousTemp = process.env.TEMP;
   const previousTmp = process.env.TMP;
   let packageVersion;
@@ -422,7 +498,13 @@ async function signSquirrel(manifest, appDir, work, output, signScript, configPa
     if (previousTmp === undefined) delete process.env.TMP;
     else process.env.TMP = previousTmp;
   }
-  if ((await readdir(work)).includes(path.basename(hookFailureMarker))) throw new Error('Squirrel signing hook failed');
+  if ((await readdir(work)).includes(path.basename(hookFailureMarker))) {
+    const failure = (await readFile(hookFailureMarker, 'utf8')).trim().split(':');
+    if (failure.length === 2 && ['Sign', 'Verify'].includes(failure[0]) && isSafePowerShellDiagnostic(failure[1])) {
+      throw new PowerShellFailure('squirrel', failure[0], failure[1]);
+    }
+    throw new Error('Squirrel signing hook failed');
+  }
   const entries = await readdir(buildDir);
   const packageFiles = entries.filter(file => /^[A-Za-z0-9][A-Za-z0-9_.-]*-full\.nupkg$/.test(file));
   if (packageFiles.length !== 1 || packageFiles[0] !== `${packageName}-${packageVersion}-full.nupkg`) throw new Error('Squirrel package output rejected');
@@ -437,12 +519,12 @@ async function signSquirrel(manifest, appDir, work, output, signScript, configPa
   for await (const chunk of createReadStream(packagePath)) hash.update(chunk);
   if (hash.digest('hex').toLowerCase() !== releaseHash.toLowerCase()) throw new Error('Squirrel package digest mismatch');
 
-  await invokePowerShell(signScript, 'Verify', configPath, path.join(buildDir, 'Setup.exe'));
+  await invokePowerShell(signScript, 'Verify', configPath, path.join(buildDir, 'Setup.exe'), 'squirrel');
   await copyOutput(path.join(buildDir, 'Setup.exe'), output, 'product.exe', manifest.max_artifact_bytes);
   await copyOutput(releasePath, output, 'RELEASES', manifest.max_artifact_bytes);
   await copyOutput(packagePath, output, packageFiles[0], manifest.max_artifact_bytes);
   const appFiles = await walkSignableFiles(appDir);
-  for (const file of appFiles) await invokePowerShell(signScript, 'Verify', configPath, file);
+  for (const file of appFiles) await invokePowerShell(signScript, 'Verify', configPath, file, 'app');
 }
 
 async function execute(manifestInput, inputZip, outputDir, authorize) {
@@ -479,7 +561,7 @@ async function execute(manifestInput, inputZip, outputDir, authorize) {
         path.join(work, 'squirrel-vendor'),
       ],
     }), { flag: 'wx', mode: 0o600 });
-    const details = await invokePowerShell(script, 'Inspect', configPath, executable);
+    const details = await invokePowerShell(script, 'Inspect', configPath, executable, 'app');
     if (normalizeProductVersion(details.product_version) !== normalizeProductVersion(manifest.version)) throw new Error('application version mismatch');
     const icon=path.join(appDir,'resources','installer.ico');
     const iconInfo=await lstat(icon);
@@ -494,8 +576,8 @@ async function execute(manifestInput, inputZip, outputDir, authorize) {
     failureCode = 'authorization';
     await authorize();
     failureCode = 'codesign';
-    await invokePowerShell(script, 'SignFolder', configPath, appDir);
-    for (const file of signable) await invokePowerShell(script, 'Verify', configPath, file);
+    await invokePowerShell(script, 'SignFolder', configPath, appDir, 'app');
+    for (const file of signable) await invokePowerShell(script, 'Verify', configPath, file, 'app');
     const signOne = async file => {
       const absolute = path.resolve(file);
       if (absolute !== path.resolve(executable) && !contained(path.resolve(appDir), absolute) && !contained(path.resolve(work, 'builder-output'), absolute)) {
@@ -506,11 +588,12 @@ async function execute(manifestInput, inputZip, outputDir, authorize) {
       const metadata = await lstat(absolute);
       if (!metadata.isFile() || metadata.isSymbolicLink()) throw new Error('signer requested an invalid file');
       try {
-        await invokePowerShell(script, 'Verify', configPath, absolute);
+        await invokePowerShell(script, 'Verify', configPath, absolute, 'nsis');
       } catch {
-        await invokePowerShell(script, 'Sign', configPath, absolute);
+        await invokePowerShell(script, 'Sign', configPath, absolute, 'nsis');
       }
     };
+    failureCode = 'packaging';
     if (manifest.windows.installer === 'nsis') {
       await signNsis(manifest, appDir, work, output, signOne, script, configPath);
     } else {
@@ -542,7 +625,11 @@ async function execute(manifestInput, inputZip, outputDir, authorize) {
   } catch (error) {
     await rm(output, { recursive: true, force: true });
     await mkdir(output, { recursive: true, mode: 0o700 });
-    throw error instanceof RunnerFailure ? error : new RunnerFailure(failureCode);
+    const clientCode = safeAuthorizationCode(error);
+    const diagnostic = error instanceof PowerShellFailure
+      ? `${error.scope}:${error.mode}:${error.diagnostic}`
+      : clientCode ? `client:${clientCode}` : null;
+    throw error instanceof RunnerFailure ? error : new RunnerFailure(failureCode, diagnostic);
   } finally {
     await rm(work, { recursive: true, force: true });
   }
@@ -552,7 +639,10 @@ export async function executeWindows(manifest, inputZip, outputDir, authorize) {
   try {
     return windowsVerificationSchema.parse(await execute(manifest, inputZip, outputDir, authorize));
   } catch (error) {
-    if (error instanceof RunnerFailure) throw new Error(`Windows signing operation failed: ${error.code}`);
+    if (error instanceof RunnerFailure) {
+      const diagnostic = error.diagnostic ? ` [${error.diagnostic}]` : '';
+      throw new Error(`Windows signing operation failed: ${error.code}${diagnostic}`);
+    }
     throw new Error('Windows signing operation failed');
   }
 }
