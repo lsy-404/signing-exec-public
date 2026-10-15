@@ -4,7 +4,7 @@ import { chmod, copyFile, lstat, mkdir, mkdtemp, readFile, readdir, readlink, rm
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { credentialsSchema, manifestSchema, verificationSchema } from './contract.mjs';
+import { credentialsSchema, macosManifestSchema as manifestSchema, macosVerificationSchema as verificationSchema } from './contract.mjs';
 import { command, fileSha256, identityHash, inspectBundle, keychainSearch, signingRequirement, snapshotArchive, staple } from './macos-sign.mjs';
 
 async function unpack(mode, archive, target, manifest) {

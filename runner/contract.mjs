@@ -13,7 +13,7 @@ export const sourceMetadataSchema = z.object({
   bundle_id: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9.-]{0,254}$/),
   architecture: z.enum(['arm64', 'x64', 'universal']),
 }).strict();
-export const manifestSchema = z.object({
+export const macosManifestSchema = z.object({
   schema_version: z.literal(1),
   request_id: z.uuid(),
   generation: z.number().int().positive(),
@@ -50,7 +50,7 @@ export const credentialsSchema = z.object({
   notarization: notarizationCredentialsSchema,
 }).strict();
 
-export const verificationSchema = z.object({
+export const macosVerificationSchema = z.object({
   schema_version: z.literal(1),
   request_id: z.uuid(),
   generation: z.number().int().positive(),
@@ -76,3 +76,40 @@ export const verificationSchema = z.object({
     sha256,
   }).strict()).length(1),
 }).strict();
+
+export const azureProfileSchema = z.object({
+  endpoint: z.literal('https://eus.codesigning.azure.net/'),
+  account: z.literal('voidcarve-signing'),
+  certificate_profile: z.literal('voidcarve-public-trust'),
+  subject: z.literal('CN=VOIDCARVE LABS, O=VOIDCARVE LABS, L=Mississauga, S=Ontario, C=CA'),
+}).strict();
+export const windowsRecipeSchema = z.object({
+  product_name: executableName,
+  electron_version: z.string().regex(/^\d+\.\d+\.\d+$/),
+  executable_name: executableName.refine(value => value.endsWith('.exe')),
+  installer: z.enum(['nsis', 'squirrel']),
+  portable: z.boolean(),
+}).strict();
+export const windowsManifestSchema = z.object({
+  schema_version: z.literal(1), request_id: z.uuid(), generation: z.number().int().positive(),
+  stage: z.literal('windows_sign'), project_id: z.string().regex(/^[a-z][a-z0-9-]{0,63}$/),
+  version: sourceMetadataSchema.shape.version, source_sha: commitSha,
+  input_digest: archiveDigest, recipe_sha: commitSha, policy_digest: archiveDigest,
+  bundle_id: sourceMetadataSchema.shape.bundle_id, architecture: z.enum(['x64', 'arm64']),
+  windows: windowsRecipeSchema, azure: azureProfileSchema,
+  max_artifact_bytes: z.number().int().positive().max(2_000_000_000),
+  max_unpacked_bytes: z.number().int().positive().max(8_000_000_000),
+}).strict();
+export const windowsVerificationSchema = z.object({
+  schema_version: z.literal(1), request_id: z.uuid(), generation: z.number().int().positive(),
+  stage: z.literal('windows_sign'), input_digest: archiveDigest, recipe_sha: commitSha, policy_digest: archiveDigest,
+  bundle_id: sourceMetadataSchema.shape.bundle_id, version: sourceMetadataSchema.shape.version,
+  architecture: z.enum(['x64', 'arm64']), subject: azureProfileSchema.shape.subject,
+  authenticode_verified: z.literal(true), timestamp_verified: z.literal(true), nested_signatures_verified: z.literal(true),
+  files: z.array(z.object({
+    path: z.union([z.enum(['product.exe', 'product-portable.exe', 'RELEASES']), z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.-]*-full\.nupkg$/)]),
+    size: z.number().int().positive(), sha256,
+  }).strict()).min(1).max(4).refine(files => new Set(files.map(file => file.path)).size === files.length),
+}).strict();
+export const manifestSchema = z.union([macosManifestSchema, windowsManifestSchema]);
+export const verificationSchema = z.union([macosVerificationSchema, windowsVerificationSchema]);

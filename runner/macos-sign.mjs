@@ -7,7 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
-import { credentialsSchema, executableName, manifestSchema, sourceMetadataSchema, verificationSchema } from './contract.mjs';
+import { credentialsSchema, executableName, macosManifestSchema as manifestSchema, sourceMetadataSchema, macosVerificationSchema as verificationSchema } from './contract.mjs';
 
 delete process.env.DEBUG;
 const require = createRequire(import.meta.url);

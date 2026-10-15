@@ -20,7 +20,8 @@ const MAX_ATTEMPTS = 5;
 const BACKOFF_MS = [2000, 4000, 8000, 16000];
 const PART_TIMEOUT_MS = 300_000;
 const ZIP = '/usr/bin/zip';
-const SAFE_OUTPUTS = new Set(['signed.tar.gz', 'product.zip', 'signed.dmg', 'product.dmg']);
+const SAFE_OUTPUTS = new Set(['signed.tar.gz', 'product.zip', 'signed.dmg', 'product.dmg', 'product.exe', 'product-portable.exe', 'RELEASES']);
+const safeOutput = name => SAFE_OUTPUTS.has(name) || /^[A-Za-z0-9][A-Za-z0-9_.-]*-full\.nupkg$/.test(name);
 
 export class ClientError extends Error {
   constructor(code, status = 0) { super(code); this.code = code; this.status = status; }
@@ -189,8 +190,17 @@ export async function downloadObject(invocation, object, destination, { digest, 
 
 export async function bundleOutput(outputDir, verification, work, maxBytes) {
   const bundle = path.join(work, 'output.zip');
-  const payload = path.join(outputDir, verification.files[0].path);
-  await execFileAsync(ZIP, ['-q', '-X', '-j', '-0', bundle, payload, path.join(outputDir, 'verification.json')]);
+  const payloads = verification.files.map(file => path.join(outputDir, file.path));
+  if (process.platform==='win32') {
+    const { createWriteStream } = await import('node:fs');
+    const { ZipArchive } = await import('archiver');
+    await new Promise((resolve,reject)=>{
+      const target=createWriteStream(bundle,{flags:'wx'}); const zip=new ZipArchive({store:true});
+      target.on('close',resolve); target.on('error',reject); zip.on('error',reject); zip.pipe(target);
+      for (const file of [...payloads,path.join(outputDir,'verification.json')]) zip.file(file,{name:path.basename(file)});
+      void zip.finalize().catch(reject);
+    });
+  } else await execFileAsync(ZIP, ['-q', '-X', '-j', '-0', bundle, ...payloads, path.join(outputDir, 'verification.json')]);
   const info = await stat(bundle);
   if (!info.isFile() || info.size < 1 || info.size > maxBytes) throw new ClientError('INVALID_OUTPUT');
   const hasher = createHash('sha256');
@@ -235,10 +245,10 @@ export async function uploadOutput(invocation, bundle, { api, fetchImpl = fetch,
 }
 
 function stageFamily(stage) {
-  if (!['sign', 'finalize', 'dmg_sign', 'dmg_finalize'].includes(stage)) throw new ClientError('INVALID_MANIFEST');
+  if (!['sign', 'finalize', 'dmg_sign', 'dmg_finalize', 'windows_sign'].includes(stage)) throw new ClientError('INVALID_MANIFEST');
   const dmg = stage.startsWith('dmg_');
   const action = stage.endsWith('finalize') ? 'finalize' : 'sign';
-  return { dmg, action };
+  return { dmg, action, windows: stage === 'windows_sign' };
 }
 
 function tempRoot() {
@@ -263,13 +273,13 @@ async function makeRunDir(input) {
 
 async function validateOutput(outputDir, manifest, verificationSchema) {
   const entries = await readdir(outputDir, { withFileTypes: true });
-  if (!entries.some(entry => entry.name === 'verification.json' && entry.isFile()) || entries.some(entry => !entry.isFile() || entry.name !== 'verification.json' && !SAFE_OUTPUTS.has(entry.name))) throw new ClientError('INVALID_OUTPUT');
+  if (!entries.some(entry => entry.name === 'verification.json' && entry.isFile()) || entries.some(entry => !entry.isFile() || entry.name !== 'verification.json' && !safeOutput(entry.name))) throw new ClientError('INVALID_OUTPUT');
   const verification = verificationSchema.parse(JSON.parse(await readFile(path.join(outputDir, 'verification.json'), 'utf8')));
-  if (verification.request_id !== manifest.request_id || verification.generation !== manifest.generation || verification.stage !== manifest.stage || verification.input_digest !== manifest.input_digest || verification.recipe_sha !== manifest.recipe_sha || verification.policy_digest !== manifest.policy_digest || verification.team_id !== manifest.team_id) throw new ClientError('INVALID_OUTPUT');
+  if (verification.request_id !== manifest.request_id || verification.generation !== manifest.generation || verification.stage !== manifest.stage || verification.input_digest !== manifest.input_digest || verification.recipe_sha !== manifest.recipe_sha || verification.policy_digest !== manifest.policy_digest || (manifest.stage==='windows_sign' ? verification.subject!==manifest.azure.subject : verification.team_id !== manifest.team_id)) throw new ClientError('INVALID_OUTPUT');
   const expectedOutput = { sign: 'signed.tar.gz', finalize: 'product.zip', dmg_sign: 'signed.dmg', dmg_finalize: 'product.dmg' }[manifest.stage];
-  if (verification.files.length !== 1 || verification.files[0].path !== expectedOutput) throw new ClientError('INVALID_OUTPUT');
+  if (manifest.stage!=='windows_sign' && (verification.files.length !== 1 || verification.files[0].path !== expectedOutput)) throw new ClientError('INVALID_OUTPUT');
   for (const file of verification.files) {
-    if (!SAFE_OUTPUTS.has(file.path) || !entries.some(entry => entry.name === file.path)) throw new ClientError('INVALID_OUTPUT');
+    if (!safeOutput(file.path) || !entries.some(entry => entry.name === file.path)) throw new ClientError('INVALID_OUTPUT');
     const info = await stat(path.join(outputDir, file.path));
     if (!info.isFile() || info.size !== file.size || info.size > manifest.max_artifact_bytes) throw new ClientError('INVALID_OUTPUT');
     const hasher = createHash('sha256');
@@ -321,6 +331,7 @@ export async function execute({ input = process.env, fetchImpl = fetch, sleep = 
         provided = true;
         if (heartbeatError) throw new ClientError('HEARTBEAT_FAILED');
         const authorized = await api('authorize-sign', invocation);
+        if (stage.windows) { if (authorized.credentials !== undefined) throw new ClientError('INVALID_RESPONSE'); return; }
         const credentials = credentialsSchema.parse(authorized.credentials);
         return credentials;
       };
@@ -328,11 +339,12 @@ export async function execute({ input = process.env, fetchImpl = fetch, sleep = 
       const authorized = await api('authorize-sign', invocation);
       if (authorized.credentials !== undefined) throw new ClientError('INVALID_RESPONSE');
     }
-    const modulePath = stage.dmg ? './dmg.mjs' : './macos-sign.mjs';
+    const modulePath = stage.windows ? './windows.mjs' : stage.dmg ? './dmg.mjs' : './macos-sign.mjs';
     const executor = await import(modulePath);
     if (heartbeatError) throw new ClientError('HEARTBEAT_FAILED');
-    if (stage.dmg && typeof executor.executeDmg !== 'function' || !stage.dmg && typeof executor.executeMacos !== 'function') throw new ClientError('EXECUTOR_UNAVAILABLE');
-    if (stage.dmg) await executor.executeDmg(manifest, inputZip, outputDir, credentialsProvider, templatePath);
+    if (stage.windows ? typeof executor.executeWindows !== 'function' : stage.dmg ? typeof executor.executeDmg !== 'function' : typeof executor.executeMacos !== 'function') throw new ClientError('EXECUTOR_UNAVAILABLE');
+    if (stage.windows) await executor.executeWindows(manifest, inputZip, outputDir, credentialsProvider);
+    else if (stage.dmg) await executor.executeDmg(manifest, inputZip, outputDir, credentialsProvider, templatePath);
     else await executor.executeMacos(manifest, inputZip, outputDir, credentialsProvider);
     if (heartbeatError) throw new ClientError('HEARTBEAT_FAILED');
     const verification = await validateOutput(outputDir, manifest, verificationSchema);
