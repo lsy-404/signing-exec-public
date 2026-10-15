@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { constants } from 'node:fs';
 import { createReadStream } from 'node:fs';
-import { chmod, copyFile, cp, lstat, mkdir, mkdtemp, open, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { chmod, copyFile, cp, lstat, mkdir, mkdtemp, open, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -391,6 +391,14 @@ async function prepareSquirrelVendor(work, installerModule) {
   const vendorSource = path.join(packageDir, '..', 'vendor');
   const vendorTarget = path.join(work, 'squirrel-vendor');
   await cp(vendorSource, vendorTarget, { recursive: true, dereference: false, errorOnExist: true });
+  const dependencyScope = path.resolve(packageDir, '..', '..');
+  if (path.basename(dependencyScope) !== 'node_modules') throw new Error('Squirrel dependency scope rejected');
+  await symlink(dependencyScope, path.join(vendorTarget, 'node_modules'), 'junction');
+  const requireVendor = createRequire(path.join(vendorTarget, 'sea-receiver.js'));
+  const requireInstaller = createRequire(installerModule);
+  for (const dependency of ['@electron/windows-sign', 'fs-extra']) {
+    if (requireVendor.resolve(dependency) !== requireInstaller.resolve(dependency)) throw new Error('Squirrel signing dependency resolution rejected');
+  }
   const archSuffix = process.arch === 'arm64' ? 'arm64' : process.arch === 'x64' ? 'x64' : null;
   if (!archSuffix) throw new Error('unsupported Windows runner architecture');
   await copyFile(path.join(vendorTarget, `7z-${archSuffix}.exe`), path.join(vendorTarget, '7z.exe'));
@@ -541,10 +549,12 @@ async function signSquirrel(manifest, appDir, work, output, signScript, configPa
     await invokePowerShell(signScript, 'Verify', configPath, squirrelExecutable, 'squirrel');
     const previousTemp = process.env.TEMP;
     const previousTmp = process.env.TMP;
+    const previousSquirrelTemp = process.env.SQUIRREL_TEMP;
     let packageVersion;
     let installerError;
     process.env.TEMP = tempDirectory;
     process.env.TMP = tempDirectory;
+    process.env.SQUIRREL_TEMP = tempDirectory;
     try {
       phase = 'squirrel_temp_validate';
       if (path.resolve(os.tmpdir()).toLowerCase() !== path.resolve(tempDirectory).toLowerCase()) throw new Error('Squirrel temporary directory was not selected');
@@ -585,6 +595,8 @@ async function signSquirrel(manifest, appDir, work, output, signScript, configPa
       else process.env.TEMP = previousTemp;
       if (previousTmp === undefined) delete process.env.TMP;
       else process.env.TMP = previousTmp;
+      if (previousSquirrelTemp === undefined) delete process.env.SQUIRREL_TEMP;
+      else process.env.SQUIRREL_TEMP = previousSquirrelTemp;
     }
     if ((await readdir(work)).includes(path.basename(hookFailureMarker))) {
       const failure = (await readFile(hookFailureMarker, 'utf8')).trim().split(':');
