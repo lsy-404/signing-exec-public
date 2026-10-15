@@ -333,7 +333,7 @@ async function invokePowerShell(script, mode, configPath, filePath, scope) {
   try {
     const result = await run(POWERSHELL, ['-NoLogo', '-NoProfile', '-NonInteractive', '-File', script, '-Mode', mode, '-ConfigPath', configPath, '-FilePath', filePath]);
     if (mode === 'SignFolder') return {};
-    return readJsonOutput(result);
+    return await readJsonOutput(result);
   } catch (error) {
     const diagnostic = error instanceof TrustedCommandFailure ? error.diagnostic : 'response_invalid';
     throw new PowerShellFailure(scope, mode, diagnostic);
