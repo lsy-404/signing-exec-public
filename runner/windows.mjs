@@ -91,7 +91,7 @@ function addArchivePath(nodes, name, kind) {
 
 function openZip(file) {
   return new Promise((resolve, reject) => {
-    yauzl.open(file, { lazyEntries: true, decodeStrings: true, validateEntrySizes: true, strictFileNames: true, autoClose: false }, (error, zip) => {
+    yauzl.open(file, { lazyEntries: true, decodeStrings: true, validateEntrySizes: true, strictFileNames: false, autoClose: false }, (error, zip) => {
       if (error) reject(error);
       else resolve(zip);
     });
