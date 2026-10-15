@@ -389,7 +389,7 @@ export async function main(args = process.argv.slice(2)) {
     } else if (args[0] === 'cleanup') await cleanup();
     else throw new ClientError('INVALID_COMMAND');
   } catch (error) {
-    const native = error instanceof Error && (/^(?:macOS signing operation failed: [a-z_]{1,64}|disk image operation failed: [a-z-]{1,64}|disk image cleanup failed)$/.test(error.message) || SAFE_WINDOWS_FAILURE.test(error.message));
+    const native = error instanceof Error && (/^(?:macOS signing operation failed: (?:[a-z_]{1,64}|stapling_exit_\d{1,3})|disk image operation failed: (?:[a-z-]{1,64}|stapling_(?:exit_\d{1,3}|command_failed))|disk image cleanup failed)$/.test(error.message) || SAFE_WINDOWS_FAILURE.test(error.message));
     const code = error instanceof ClientError ? error.code : native ? error.message : 'CLIENT_FAILED';
     writeSync(2, `${code}\n`);
     process.exitCode = 1;
