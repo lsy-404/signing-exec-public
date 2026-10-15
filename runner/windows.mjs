@@ -141,8 +141,12 @@ function squirrelInstallerDiagnostic(error) {
   };
   if (error && typeof error.code === 'string' && Object.hasOwn(knownCodes, error.code)) return knownCodes[error.code];
   const message = typeof error?.message === 'string' ? error.message : '';
-  const exit = /Failed with exit code\s*:\s*(\d{1,3})\b/i.exec(message);
-  if (exit && Number(exit[1]) <= 255) return `squirrel_child_exit_${Number(exit[1])}`;
+  const exit = /Failed with exit code\s*:\s*(-?\d{1,10})\b/i.exec(message);
+  const exitCode = exit ? Number(exit[1]) : null;
+  if (Number.isInteger(exitCode) && exitCode >= -0x80000000 && exitCode <= 0xffffffff) {
+    if (exitCode >= 0 && exitCode <= 255) return `squirrel_child_exit_${exitCode}`;
+    return `squirrel_child_status_0x${(exitCode >>> 0).toString(16).padStart(8, '0')}`;
+  }
   return 'squirrel_installer_failed';
 }
 
@@ -485,13 +489,33 @@ async function signNsis(manifest, appDir, work, output, signOne, signScript, con
     if (error instanceof PowerShellFailure || error instanceof PackagingFailure) throw error;
     const builderCodes = {
       ERR_ELECTRON_BUILDER_INVALID_CONFIGURATION: 'nsis_configuration',
-      ERR_ELECTRON_BUILDER_CANNOT_EXECUTE: 'nsis_tool_execution',
       MODULE_NOT_FOUND: 'nsis_dependency_missing',
       ERR_MODULE_NOT_FOUND: 'nsis_dependency_missing',
       ENOENT: 'nsis_dependency_missing',
       EACCES: 'nsis_access_denied',
       EPERM: 'nsis_access_denied',
     };
+    if (phase === 'nsis_builder' && error?.code === 'ERR_ELECTRON_BUILDER_CANNOT_EXECUTE') {
+      const message = typeof error.message === 'string' ? error.message : '';
+      const toolMatch = /(?:^|[\\/])([^\\/]+)\s+process failed ERR_ELECTRON_BUILDER_CANNOT_EXECUTE\b/i.exec(message);
+      const toolName = toolMatch?.[1]?.toLowerCase().replace(/\.exe$/, '');
+      const knownTools = new Map([
+        ['makensis', 'makensis'],
+        ['7z', '7z'],
+        ['7za', '7z'],
+        ['rcedit', 'rcedit'],
+        ['signtool', 'signtool'],
+      ]);
+      const trustedTool = knownTools.get(toolName);
+      const exitCode = error.exitCode;
+      if (trustedTool && Number.isInteger(exitCode) && exitCode >= -0x80000000 && exitCode <= 0xffffffff) {
+        if (exitCode >= 1 && exitCode <= 255) throw new PackagingFailure(`nsis_tool_${trustedTool}_exit_${exitCode}`);
+        const status = (exitCode >>> 0).toString(16).padStart(8, '0');
+        throw new PackagingFailure(`nsis_tool_${trustedTool}_status_0x${status}`);
+      }
+      if (trustedTool) throw new PackagingFailure(`nsis_tool_${trustedTool}_failed`);
+      throw new PackagingFailure('nsis_tool_execution');
+    }
     if (phase === 'nsis_builder' && Object.hasOwn(builderCodes, error?.code)) throw new PackagingFailure(builderCodes[error.code]);
     throw new PackagingFailure(phase);
   }
