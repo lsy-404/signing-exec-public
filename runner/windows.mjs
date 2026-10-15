@@ -131,6 +131,21 @@ function safeAuthorizationCode(error) {
   return null;
 }
 
+function squirrelInstallerDiagnostic(error) {
+  const knownCodes = {
+    ENOENT: 'squirrel_resource_missing',
+    EACCES: 'squirrel_access_denied',
+    EPERM: 'squirrel_access_denied',
+    ENOSPC: 'squirrel_storage_full',
+    EEXIST: 'squirrel_output_collision',
+  };
+  if (error && typeof error.code === 'string' && Object.hasOwn(knownCodes, error.code)) return knownCodes[error.code];
+  const message = typeof error?.message === 'string' ? error.message : '';
+  const exit = /Failed with exit code\s*:\s*(\d{1,3})\b/i.exec(message);
+  if (exit && Number(exit[1]) <= 255) return `squirrel_child_exit_${Number(exit[1])}`;
+  return 'squirrel_installer_failed';
+}
+
 function contained(root, target) {
   const relative = path.relative(root, target);
   return relative !== '' && relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
@@ -503,6 +518,7 @@ async function signSquirrel(manifest, appDir, work, output, signScript, configPa
     const previousTemp = process.env.TEMP;
     const previousTmp = process.env.TMP;
     let packageVersion;
+    let installerError;
     process.env.TEMP = tempDirectory;
     process.env.TMP = tempDirectory;
     try {
@@ -515,27 +531,31 @@ async function signSquirrel(manifest, appDir, work, output, signScript, configPa
       }
       packageVersion = convertVersion(manifest.version);
       phase = 'squirrel_installer_create';
-      await createWindowsInstaller({
-        appDirectory: appDir,
-        outputDirectory: buildDir,
-        vendorDirectory,
-        name: packageName,
-        title: manifest.windows.product_name,
-        productName: manifest.windows.product_name,
-        version: packageVersion,
-        exe: manifest.windows.executable_name,
-        description: manifest.windows.product_name,
-        authors: 'VOIDCARVE LABS',
-        owners: 'VOIDCARVE LABS',
-        setupExe: 'Setup.exe',
-        setupIcon: path.join(appDir,'resources','installer.ico'),
-        skipUpdateIcon: true,
-        noMsi: true,
-        noDelta: true,
-        usePackageJson: false,
-        fixUpPaths: false,
-        windowsSign: { hookModulePath: hookModule },
-      });
+      try {
+        await createWindowsInstaller({
+          appDirectory: appDir,
+          outputDirectory: buildDir,
+          vendorDirectory,
+          name: packageName,
+          title: manifest.windows.product_name,
+          productName: manifest.windows.product_name,
+          version: packageVersion,
+          exe: manifest.windows.executable_name,
+          description: manifest.windows.product_name,
+          authors: 'VOIDCARVE LABS',
+          owners: 'VOIDCARVE LABS',
+          setupExe: 'Setup.exe',
+          setupIcon: path.join(appDir,'resources','installer.ico'),
+          skipUpdateIcon: true,
+          noMsi: true,
+          noDelta: true,
+          usePackageJson: false,
+          fixUpPaths: false,
+          windowsSign: { hookModulePath: hookModule },
+        });
+      } catch (error) {
+        installerError = error;
+      }
     } finally {
       if (previousTemp === undefined) delete process.env.TEMP;
       else process.env.TEMP = previousTemp;
@@ -547,8 +567,9 @@ async function signSquirrel(manifest, appDir, work, output, signScript, configPa
       if (failure.length === 2 && ['Sign', 'Verify'].includes(failure[0]) && isSafePowerShellDiagnostic(failure[1])) {
         throw new PowerShellFailure('squirrel', failure[0], failure[1]);
       }
-      throw new Error('Squirrel signing hook failed');
+      throw new PackagingFailure('squirrel_hook_failed');
     }
+    if (installerError) throw new PackagingFailure(squirrelInstallerDiagnostic(installerError));
     phase = 'squirrel_output_validate';
     const entries = await readdir(buildDir);
     const packageFiles = entries.filter(file => /^[A-Za-z0-9][A-Za-z0-9_.-]*-full\.nupkg$/.test(file));
