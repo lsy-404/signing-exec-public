@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { constants } from 'node:fs';
 import { createReadStream } from 'node:fs';
-import { chmod, copyFile, cp, lstat, mkdir, mkdtemp, open, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, copyFile, cp, lstat, mkdir, mkdtemp, open, readFile, readdir, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -14,6 +14,13 @@ import { sourceMetadataSchema, windowsManifestSchema, windowsVerificationSchema 
 const SUBJECT = 'CN=VOIDCARVE LABS, O=VOIDCARVE LABS, L=Mississauga, S=Ontario, C=CA';
 const TIMESTAMP_URL = 'http://timestamp.acs.microsoft.com';
 const SIGNABLE_EXTENSIONS = new Set(['.exe', '.dll', '.node']);
+const NSIS_TOOLS = new Map([
+  ['makensis', 'makensis'],
+  ['7z', '7z'],
+  ['7za', '7z'],
+  ['rcedit', 'rcedit'],
+  ['signtool', 'signtool'],
+]);
 const REPOSITORY_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const POWERSHELL = 'pwsh.exe';
 const SAFE_AUTHORIZATION_CODES = new Set(['CREDENTIALS_ALREADY_REQUESTED', 'HEARTBEAT_FAILED', 'INVALID_RESPONSE']);
@@ -125,6 +132,67 @@ function isSafePowerShellDiagnostic(value) {
   return /^(?:aadsts_\d{5,9}|hresult_0x[0-9a-f]{8}|http_status_[45]\d{2}|ps_(?:product_version_missing|authenticode_invalid|signer_missing|subject_unexpected|timestamp_missing|path_outside_root|inspection_outside_app|directory_outside_app|directory_missing|file_missing|file_type_unsupported|module_missing|command_missing|no_files_to_sign|dotnet8_missing)|signtool_exit_(?:0|[1-9]\d?|1\d{2}|2[0-4]\d|25[0-5])|signcli_exit_(?:0|[1-9]\d?|1\d{2}|2[0-4]\d|25[0-5])|powershell_exit_(?:0|[1-9]\d?|1\d{2}|2[0-4]\d|25[0-5])|powershell_failed|process_unavailable|output_limit|response_invalid)$/.test(value);
 }
 
+function nsisBuilderTool(error) {
+  const message = typeof error?.message === 'string' ? error.message : '';
+  const match = /(?:^|[\\/])([^\\/]+)\s+process failed ERR_ELECTRON_BUILDER_CANNOT_EXECUTE\b/i.exec(message);
+  return NSIS_TOOLS.get(match?.[1]?.toLowerCase().replace(/\.exe$/, '')) ?? null;
+}
+
+async function savePrivateNsisDiagnostic(error) {
+  if (process.env.RUNNER_VISIBILITY !== 'private' || nsisBuilderTool(error) !== 'makensis') return;
+  const runnerTemp = process.env.RUNNER_TEMP;
+  if (typeof runnerTemp !== 'string' || !runnerTemp || !path.isAbsolute(runnerTemp) || runnerTemp.length > 32_767) return;
+  let target;
+  let created = false;
+  try {
+    const metadata = await lstat(runnerTemp);
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) return;
+    const directory = await realpath(runnerTemp);
+    const normalize = value => path.win32.resolve(value).replace(/^\\\\\?\\/, '').toLowerCase();
+    if (normalize(runnerTemp) !== normalize(directory)) return;
+
+    const message = process.getBuiltinModule('node:util').stripVTControlCharacters(error.message);
+    const sections = [];
+    for (const heading of ['\nOutput:\n', '\nError output:\n']) {
+      const start = message.indexOf(heading);
+      if (start < 0) continue;
+      const bodyStart = start + heading.length;
+      const nextOutput = message.indexOf('\nOutput:\n', bodyStart);
+      const nextError = message.indexOf('\nError output:\n', bodyStart);
+      const candidates = [nextOutput, nextError].filter(index => index >= 0);
+      sections.push(message.slice(bodyStart, candidates.length ? Math.min(...candidates) : undefined));
+    }
+
+    const selected = [];
+    let byteLength = 0;
+    for (const line of sections.join('\n').split(/\r?\n/)) {
+      const value = line.trim();
+      if (!value || /(?:bearer|authorization|nonce|token|secret)/i.test(value)) continue;
+      if (!/^(?:Error\b|!|Plugin not found\b|Can't\b|Cannot\b)/i.test(value)) continue;
+      const lineBytes = Buffer.byteLength(`${value}\n`, 'utf8');
+      if (byteLength + lineBytes > 8 * 1024) break;
+      selected.push(value);
+      byteLength += lineBytes;
+    }
+    if (!selected.length) return;
+
+    const diagnostic = Buffer.from(`${selected.join('\n')}\n`, 'utf8');
+    target = path.join(directory, 'voidcarve-nsis-diagnostic.txt');
+    const file = await open(target, 'wx', 0o600);
+    created = true;
+    try {
+      await file.writeFile(diagnostic);
+      await file.chmod(0o600);
+    } finally {
+      await file.close();
+    }
+    created = false;
+  } catch {
+    if (created && target) await rm(target, { force: true }).catch(() => {});
+    return;
+  }
+}
+
 function safeAuthorizationCode(error) {
   const code = error && typeof error.code === 'string' ? error.code : '';
   if (/^API_[A-Z_]{1,64}$/.test(code) || SAFE_AUTHORIZATION_CODES.has(code)) return code;
@@ -141,6 +209,17 @@ function squirrelInstallerDiagnostic(error) {
   };
   if (error && typeof error.code === 'string' && Object.hasOwn(knownCodes, error.code)) return knownCodes[error.code];
   const message = typeof error?.message === 'string' ? error.message : '';
+  const knownMessages = new Map([
+    ["Can't read and write to target executable", 'squirrel_sea_access_failed'],
+    ["Couldn't read target executable", 'squirrel_sea_access_failed'],
+    ["Couldn't write executable", 'squirrel_sea_access_failed'],
+    ['Executable must be a supported format: ELF, PE, or Mach-O', 'squirrel_sea_format_unsupported'],
+    ['Error when injecting resource', 'squirrel_sea_injection_failed'],
+  ]);
+  if (knownMessages.has(message)) return knownMessages.get(message);
+  if (message.startsWith('Could not find the sentinel NODE_SEA_FUSE_')) return 'squirrel_sea_sentinel_missing';
+  if (message.startsWith('Multiple occurences of sentinel "NODE_SEA_FUSE_')) return 'squirrel_sea_sentinel_multiple';
+  if (message.startsWith('In order to use windowsSign options, @electron/windows-sign must be installed as a dependency.')) return 'squirrel_dependency_unavailable';
   const exit = /Failed with exit code\s*:\s*(-?\d{1,10})\b/i.exec(message);
   const exitCode = exit ? Number(exit[1]) : null;
   if (Number.isInteger(exitCode) && exitCode >= -0x80000000 && exitCode <= 0xffffffff) {
@@ -504,18 +583,9 @@ async function signNsis(manifest, appDir, work, output, signOne, signScript, con
       EPERM: 'nsis_access_denied',
     };
     if (phase === 'nsis_builder' && error?.code === 'ERR_ELECTRON_BUILDER_CANNOT_EXECUTE') {
-      const message = typeof error.message === 'string' ? error.message : '';
-      const toolMatch = /(?:^|[\\/])([^\\/]+)\s+process failed ERR_ELECTRON_BUILDER_CANNOT_EXECUTE\b/i.exec(message);
-      const toolName = toolMatch?.[1]?.toLowerCase().replace(/\.exe$/, '');
-      const knownTools = new Map([
-        ['makensis', 'makensis'],
-        ['7z', '7z'],
-        ['7za', '7z'],
-        ['rcedit', 'rcedit'],
-        ['signtool', 'signtool'],
-      ]);
-      const trustedTool = knownTools.get(toolName);
+      const trustedTool = nsisBuilderTool(error);
       const exitCode = error.exitCode;
+      if (trustedTool === 'makensis') await savePrivateNsisDiagnostic(error);
       if (trustedTool && Number.isInteger(exitCode) && exitCode >= -0x80000000 && exitCode <= 0xffffffff) {
         if (exitCode >= 1 && exitCode <= 255) throw new PackagingFailure(`nsis_tool_${trustedTool}_exit_${exitCode}`);
         const status = (exitCode >>> 0).toString(16).padStart(8, '0');
