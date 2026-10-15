@@ -93,9 +93,18 @@ switch ($Mode) {
       ExcludeInteractiveBrowserCredential = $true
     }
     if ($Mode -eq 'SignFolder') {
-      $parameters.FilesFolder = $file
-      $parameters.FilesFolderFilter = 'exe,EXE,dll,DLL,node,NODE'
-      $parameters.FilesFolderRecurse = $true
+      $catalogRoot = Split-Path -Parent $ConfigPath
+      $catalog = Join-Path $catalogRoot 'signable-files.txt'
+      $entries = @(foreach ($entry in $config.signable_files) {
+        $candidate = [System.IO.Path]::GetFullPath($entry)
+        if (-not (Test-WithinRoot $candidate $config.app_root)) { throw 'signing path outside approved roots' }
+        if (-not [System.IO.File]::Exists($candidate)) { throw 'signable file missing' }
+        if ([System.IO.Path]::GetExtension($candidate) -notin @('.exe', '.dll', '.node')) { throw 'unsupported Authenticode file type' }
+        [System.Management.Automation.WildcardPattern]::Escape([System.IO.Path]::GetRelativePath($catalogRoot, $candidate))
+      })
+      if ($entries.Count -eq 0) { throw 'No files were found to sign' }
+      [System.IO.File]::WriteAllLines($catalog, [string[]]$entries, [System.Text.UTF8Encoding]::new($false))
+      $parameters.FilesCatalog = $catalog
     } else {
       $parameters.Files = $file
     }

@@ -285,30 +285,40 @@ async function walkSignableFiles(root) {
       const metadata = await lstat(target);
       if (metadata.isSymbolicLink() || !contained(root, target)) throw new Error('application link rejected');
       if (metadata.isDirectory()) pending.push(target);
-      else if (metadata.isFile() && SIGNABLE_EXTENSIONS.has(path.extname(entry.name).toLowerCase())) found.push(target);
-      else if (!metadata.isFile()) throw new Error('special application file rejected');
+      else if (metadata.isFile() && SIGNABLE_EXTENSIONS.has(path.extname(entry.name).toLowerCase())) {
+        if (await inspectPeMachine(target, path.extname(entry.name).toLowerCase() === '.node') !== null) found.push(target);
+      } else if (!metadata.isFile()) throw new Error('special application file rejected');
     }
   }
   return found.sort((left, right) => left.localeCompare(right, 'en'));
 }
 
-async function inspectPeArchitecture(file) {
+async function inspectPeMachine(file, allowOtherFormats = false) {
   const handle = await open(file, constants.O_RDONLY);
   try {
     const metadata = await handle.stat();
     const dos = Buffer.alloc(64);
-    if (metadata.size < dos.length || (await handle.read(dos, 0, dos.length, 0)).bytesRead !== dos.length || dos.readUInt16LE(0) !== 0x5a4d) throw new Error('invalid PE executable');
+    const { bytesRead } = await handle.read(dos, 0, dos.length, 0);
+    if (bytesRead < 2 || dos.readUInt16LE(0) !== 0x5a4d) {
+      if (allowOtherFormats) return null;
+      throw new Error('invalid PE executable');
+    }
+    if (bytesRead !== dos.length) throw new Error('invalid PE executable');
     const peOffset = dos.readUInt32LE(0x3c);
     if (peOffset > metadata.size - 6 || peOffset > 16 * 1024 * 1024) throw new Error('invalid PE executable');
     const header = Buffer.alloc(6);
     if ((await handle.read(header, 0, header.length, peOffset)).bytesRead !== header.length || header.toString('ascii', 0, 4) !== 'PE\0\0') throw new Error('invalid PE executable');
-    const machine = header.readUInt16LE(4);
-    if (machine === 0x8664) return 'x64';
-    if (machine === 0xaa64) return 'arm64';
-    throw new Error('unsupported PE architecture');
+    return header.readUInt16LE(4);
   } finally {
     await handle.close();
   }
+}
+
+async function inspectPeArchitecture(file) {
+  const machine = await inspectPeMachine(file);
+  if (machine === 0x8664) return 'x64';
+  if (machine === 0xaa64) return 'arm64';
+  throw new Error('unsupported PE architecture');
 }
 
 function normalizeProductVersion(value) {
@@ -463,7 +473,7 @@ async function signSquirrel(manifest, appDir, work, output, signScript, configPa
     await writeFile(hookModule, trustedHookSource(signScript, configPath, hookFailureMarker), { flag: 'wx', mode: 0o600 });
     const tempDirectory = path.join(work, 'squirrel-temp');
     await mkdir(tempDirectory, { recursive: false, mode: 0o700 });
-    const installerModule = path.join(REPOSITORY_ROOT, 'runner', 'node_modules', 'electron-winstaller', 'lib', 'index.js');
+    const installerModule = createRequire(import.meta.url).resolve('electron-winstaller');
     const vendorDirectory = await prepareSquirrelVendor(work, installerModule);
     phase = 'squirrel_vendor_sign';
     const squirrelExecutable = path.join(vendorDirectory, 'Squirrel.exe');
@@ -570,9 +580,11 @@ async function execute(manifestInput, inputZip, outputDir, authorize) {
     const executableStat = await lstat(executable);
     if (!executableStat.isFile() || executableStat.isSymbolicLink() || !contained(path.resolve(appDir), path.resolve(executable))) throw new Error('approved application executable missing');
     if (await inspectPeArchitecture(executable) !== manifest.architecture) throw new Error('application architecture mismatch');
+    const signable = await walkSignableFiles(appDir);
     await writeFile(configPath, JSON.stringify({
       azure: manifest.azure,
       app_root: appDir,
+      signable_files: signable,
       allowed_roots: [
         appDir,
         path.join(work, 'builder-output'),
@@ -588,7 +600,6 @@ async function execute(manifestInput, inputZip, outputDir, authorize) {
     if (!iconInfo.isFile()||iconInfo.isSymbolicLink()||iconInfo.size<6||iconInfo.size>4_000_000) throw new Error('installer icon rejected');
     const iconHeader=(await readFile(icon)).subarray(0,6);
     if(iconHeader.readUInt16LE(0)!==0||iconHeader.readUInt16LE(2)!==1||iconHeader.readUInt16LE(4)<1) throw new Error('installer icon rejected');
-    const signable = await walkSignableFiles(appDir);
     if (!signable.includes(executable)) throw new Error('main executable is not a signable file');
     if (manifest.windows.installer === 'squirrel' && !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$/.test(manifest.windows.product_name)) {
       throw new Error('Squirrel product name is not package-safe');
