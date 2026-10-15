@@ -420,6 +420,7 @@ async function signNsis(manifest, appDir, work, output, signOne, signScript, con
     const { Arch, Platform, build } = await import('electron-builder');
     phase = 'nsis_builder';
     await build({
+      publish: 'never',
       targets: Platform.WINDOWS.createTarget(['nsis', ...(manifest.windows.portable ? ['portable'] : [])], manifest.architecture === 'x64' ? Arch.x64 : Arch.arm64),
       projectDir,
       prepackaged: appDir,
