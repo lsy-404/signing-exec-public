@@ -8,7 +8,6 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { pipeline } from 'node:stream/promises';
 import yauzl from 'yauzl';
-import { Arch, Platform, build } from 'electron-builder';
 import { createRequire } from 'node:module';
 import { sourceMetadataSchema, windowsManifestSchema, windowsVerificationSchema } from './contract.mjs';
 
@@ -40,6 +39,13 @@ class PowerShellFailure extends Error {
     this.scope = scope;
     this.mode = mode;
     this.diagnostic = diagnostic;
+  }
+}
+
+class PackagingFailure extends Error {
+  constructor(phase) {
+    super('trusted packaging step failed');
+    this.phase = phase;
   }
 }
 
@@ -79,7 +85,8 @@ async function run(file, args, { timeout = 300_000, maxOutput = 8 * 1024 * 1024,
 }
 
 function powerShellDiagnostic(output, exitCode) {
-  const text = `${output.stderr}\n${output.stdout}`;
+  const { stripVTControlCharacters } = process.getBuiltinModule('node:util');
+  const text = stripVTControlCharacters(`${output.stderr}\n${output.stdout}`).replace(/\s+/g, ' ');
   const aadsts = /\bAADSTS(\d{5,9})\b/i.exec(text);
   if (aadsts) return `aadsts_${aadsts[1]}`;
   const hresult = /\b(0x[0-9a-f]{8})\b/i.exec(text);
@@ -398,6 +405,7 @@ async function signNsis(manifest, appDir, work, output, signOne, signScript, con
   };
   await writeFile(path.join(projectDir, 'package.json'), JSON.stringify(packageJson), { flag: 'wx', mode: 0o600 });
   const name = manifest.windows.executable_name.slice(0, -4);
+  const { Arch, Platform, build } = await import('electron-builder');
   await build({
     targets: Platform.WINDOWS.createTarget(['nsis', ...(manifest.windows.portable ? ['portable'] : [])], manifest.architecture === 'x64' ? Arch.x64 : Arch.arm64),
     projectDir,
@@ -445,86 +453,98 @@ async function signNsis(manifest, appDir, work, output, signOne, signScript, con
 
 async function signSquirrel(manifest, appDir, work, output, signScript, configPath) {
   if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$/.test(manifest.windows.product_name)) throw new Error('Squirrel product name is not package-safe');
-  const packageName = `${manifest.windows.product_name}-${manifest.architecture}`;
-  const buildDir = path.join(work, 'squirrel-output');
-  await mkdir(buildDir, { recursive: false, mode: 0o700 });
-  const hookModule = path.join(work, 'squirrel-sign-hook.cjs');
-  const hookFailureMarker = path.join(work, 'squirrel-signing-failed');
-  await writeFile(hookModule, trustedHookSource(signScript, configPath, hookFailureMarker), { flag: 'wx', mode: 0o600 });
-  const tempDirectory = path.join(work, 'squirrel-temp');
-  await mkdir(tempDirectory, { recursive: false, mode: 0o700 });
-  const installerModule = path.join(REPOSITORY_ROOT, 'runner', 'node_modules', 'electron-winstaller', 'lib', 'index.js');
-  const vendorDirectory = await prepareSquirrelVendor(work, installerModule);
-  const squirrelExecutable = path.join(vendorDirectory, 'Squirrel.exe');
-  await invokePowerShell(signScript, 'Sign', configPath, squirrelExecutable, 'squirrel');
-  await invokePowerShell(signScript, 'Verify', configPath, squirrelExecutable, 'squirrel');
-  const previousTemp = process.env.TEMP;
-  const previousTmp = process.env.TMP;
-  let packageVersion;
-  process.env.TEMP = tempDirectory;
-  process.env.TMP = tempDirectory;
+  let phase = 'squirrel_vendor_prepare';
   try {
-    if (path.resolve(os.tmpdir()).toLowerCase() !== path.resolve(tempDirectory).toLowerCase()) throw new Error('Squirrel temporary directory was not selected');
-    const { convertVersion, createWindowsInstaller } = await import('electron-winstaller');
-    const requireInstaller = createRequire(installerModule);
-    if (path.resolve(requireInstaller('temp').dir).toLowerCase() !== path.resolve(tempDirectory).toLowerCase()) {
-      throw new Error('Squirrel dependency temporary directory was not selected');
+    const packageName = `${manifest.windows.product_name}-${manifest.architecture}`;
+    const buildDir = path.join(work, 'squirrel-output');
+    await mkdir(buildDir, { recursive: false, mode: 0o700 });
+    const hookModule = path.join(work, 'squirrel-sign-hook.cjs');
+    const hookFailureMarker = path.join(work, 'squirrel-signing-failed');
+    await writeFile(hookModule, trustedHookSource(signScript, configPath, hookFailureMarker), { flag: 'wx', mode: 0o600 });
+    const tempDirectory = path.join(work, 'squirrel-temp');
+    await mkdir(tempDirectory, { recursive: false, mode: 0o700 });
+    const installerModule = path.join(REPOSITORY_ROOT, 'runner', 'node_modules', 'electron-winstaller', 'lib', 'index.js');
+    const vendorDirectory = await prepareSquirrelVendor(work, installerModule);
+    phase = 'squirrel_vendor_sign';
+    const squirrelExecutable = path.join(vendorDirectory, 'Squirrel.exe');
+    await invokePowerShell(signScript, 'Sign', configPath, squirrelExecutable, 'squirrel');
+    await invokePowerShell(signScript, 'Verify', configPath, squirrelExecutable, 'squirrel');
+    const previousTemp = process.env.TEMP;
+    const previousTmp = process.env.TMP;
+    let packageVersion;
+    process.env.TEMP = tempDirectory;
+    process.env.TMP = tempDirectory;
+    try {
+      phase = 'squirrel_temp_validate';
+      if (path.resolve(os.tmpdir()).toLowerCase() !== path.resolve(tempDirectory).toLowerCase()) throw new Error('Squirrel temporary directory was not selected');
+      const { convertVersion, createWindowsInstaller } = await import('electron-winstaller');
+      const requireInstaller = createRequire(installerModule);
+      if (path.resolve(requireInstaller('temp').dir).toLowerCase() !== path.resolve(tempDirectory).toLowerCase()) {
+        throw new Error('Squirrel dependency temporary directory was not selected');
+      }
+      packageVersion = convertVersion(manifest.version);
+      phase = 'squirrel_installer_create';
+      await createWindowsInstaller({
+        appDirectory: appDir,
+        outputDirectory: buildDir,
+        vendorDirectory,
+        name: packageName,
+        title: manifest.windows.product_name,
+        productName: manifest.windows.product_name,
+        version: packageVersion,
+        exe: manifest.windows.executable_name,
+        description: manifest.windows.product_name,
+        authors: 'VOIDCARVE LABS',
+        owners: 'VOIDCARVE LABS',
+        setupExe: 'Setup.exe',
+        setupIcon: path.join(appDir,'resources','installer.ico'),
+        skipUpdateIcon: true,
+        noMsi: true,
+        noDelta: true,
+        usePackageJson: false,
+        fixUpPaths: false,
+        windowsSign: { hookModulePath: hookModule },
+      });
+    } finally {
+      if (previousTemp === undefined) delete process.env.TEMP;
+      else process.env.TEMP = previousTemp;
+      if (previousTmp === undefined) delete process.env.TMP;
+      else process.env.TMP = previousTmp;
     }
-    packageVersion = convertVersion(manifest.version);
-    await createWindowsInstaller({
-      appDirectory: appDir,
-      outputDirectory: buildDir,
-      vendorDirectory,
-      name: packageName,
-      title: manifest.windows.product_name,
-      productName: manifest.windows.product_name,
-      version: packageVersion,
-      exe: manifest.windows.executable_name,
-      description: manifest.windows.product_name,
-      authors: 'VOIDCARVE LABS',
-      owners: 'VOIDCARVE LABS',
-      setupExe: 'Setup.exe',
-      setupIcon: path.join(appDir,'resources','installer.ico'),
-      skipUpdateIcon: true,
-      noMsi: true,
-      noDelta: true,
-      usePackageJson: false,
-      fixUpPaths: false,
-      windowsSign: { hookModulePath: hookModule },
-    });
-  } finally {
-    if (previousTemp === undefined) delete process.env.TEMP;
-    else process.env.TEMP = previousTemp;
-    if (previousTmp === undefined) delete process.env.TMP;
-    else process.env.TMP = previousTmp;
-  }
-  if ((await readdir(work)).includes(path.basename(hookFailureMarker))) {
-    const failure = (await readFile(hookFailureMarker, 'utf8')).trim().split(':');
-    if (failure.length === 2 && ['Sign', 'Verify'].includes(failure[0]) && isSafePowerShellDiagnostic(failure[1])) {
-      throw new PowerShellFailure('squirrel', failure[0], failure[1]);
+    if ((await readdir(work)).includes(path.basename(hookFailureMarker))) {
+      const failure = (await readFile(hookFailureMarker, 'utf8')).trim().split(':');
+      if (failure.length === 2 && ['Sign', 'Verify'].includes(failure[0]) && isSafePowerShellDiagnostic(failure[1])) {
+        throw new PowerShellFailure('squirrel', failure[0], failure[1]);
+      }
+      throw new Error('Squirrel signing hook failed');
     }
-    throw new Error('Squirrel signing hook failed');
-  }
-  const entries = await readdir(buildDir);
-  const packageFiles = entries.filter(file => /^[A-Za-z0-9][A-Za-z0-9_.-]*-full\.nupkg$/.test(file));
-  if (packageFiles.length !== 1 || packageFiles[0] !== `${packageName}-${packageVersion}-full.nupkg`) throw new Error('Squirrel package output rejected');
-  const releasePath = path.join(buildDir, 'RELEASES');
-  const releases = (await readFile(releasePath, 'utf8')).trim().split(/\r?\n/);
-  if (releases.length !== 1) throw new Error('Squirrel release index rejected');
-  const [releaseHash, releaseFile, releaseSizeText] = releases[0].split(' ');
-  const packagePath = path.join(buildDir, packageFiles[0]);
-  const packageStat = await lstat(packagePath);
-  if (releaseFile !== packageFiles[0] || !/^[a-f0-9]{40}$/i.test(releaseHash) || Number(releaseSizeText) !== packageStat.size) throw new Error('Squirrel release index mismatch');
-  const hash = createHash('sha1');
-  for await (const chunk of createReadStream(packagePath)) hash.update(chunk);
-  if (hash.digest('hex').toLowerCase() !== releaseHash.toLowerCase()) throw new Error('Squirrel package digest mismatch');
+    phase = 'squirrel_output_validate';
+    const entries = await readdir(buildDir);
+    const packageFiles = entries.filter(file => /^[A-Za-z0-9][A-Za-z0-9_.-]*-full\.nupkg$/.test(file));
+    if (packageFiles.length !== 1 || packageFiles[0] !== `${packageName}-${packageVersion}-full.nupkg`) throw new Error('Squirrel package output rejected');
+    const releasePath = path.join(buildDir, 'RELEASES');
+    const releases = (await readFile(releasePath, 'utf8')).trim().split(/\r?\n/);
+    if (releases.length !== 1) throw new Error('Squirrel release index rejected');
+    const [releaseHash, releaseFile, releaseSizeText] = releases[0].split(' ');
+    const packagePath = path.join(buildDir, packageFiles[0]);
+    const packageStat = await lstat(packagePath);
+    if (releaseFile !== packageFiles[0] || !/^[a-f0-9]{40}$/i.test(releaseHash) || Number(releaseSizeText) !== packageStat.size) throw new Error('Squirrel release index mismatch');
+    const hash = createHash('sha1');
+    for await (const chunk of createReadStream(packagePath)) hash.update(chunk);
+    if (hash.digest('hex').toLowerCase() !== releaseHash.toLowerCase()) throw new Error('Squirrel package digest mismatch');
 
-  await invokePowerShell(signScript, 'Verify', configPath, path.join(buildDir, 'Setup.exe'), 'squirrel');
-  await copyOutput(path.join(buildDir, 'Setup.exe'), output, 'product.exe', manifest.max_artifact_bytes);
-  await copyOutput(releasePath, output, 'RELEASES', manifest.max_artifact_bytes);
-  await copyOutput(packagePath, output, packageFiles[0], manifest.max_artifact_bytes);
-  const appFiles = await walkSignableFiles(appDir);
-  for (const file of appFiles) await invokePowerShell(signScript, 'Verify', configPath, file, 'app');
+    phase = 'squirrel_setup_verify';
+    await invokePowerShell(signScript, 'Verify', configPath, path.join(buildDir, 'Setup.exe'), 'squirrel');
+    phase = 'squirrel_output_copy';
+    await copyOutput(path.join(buildDir, 'Setup.exe'), output, 'product.exe', manifest.max_artifact_bytes);
+    await copyOutput(releasePath, output, 'RELEASES', manifest.max_artifact_bytes);
+    await copyOutput(packagePath, output, packageFiles[0], manifest.max_artifact_bytes);
+    const appFiles = await walkSignableFiles(appDir);
+    for (const file of appFiles) await invokePowerShell(signScript, 'Verify', configPath, file, 'app');
+  } catch (error) {
+    if (error instanceof PowerShellFailure || error instanceof PackagingFailure) throw error;
+    throw new PackagingFailure(phase);
+  }
 }
 
 async function execute(manifestInput, inputZip, outputDir, authorize) {
@@ -628,6 +648,7 @@ async function execute(manifestInput, inputZip, outputDir, authorize) {
     const clientCode = safeAuthorizationCode(error);
     const diagnostic = error instanceof PowerShellFailure
       ? `${error.scope}:${error.mode}:${error.diagnostic}`
+      : error instanceof PackagingFailure ? error.phase
       : clientCode ? `client:${clientCode}` : null;
     throw error instanceof RunnerFailure ? error : new RunnerFailure(failureCode, diagnostic);
   } finally {

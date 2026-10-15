@@ -24,16 +24,22 @@ function Test-WithinRoot([string]$Path, [string]$Root) {
 }
 
 function Verify-Authenticode([string]$Path, [string]$Subject) {
-  $signature = Get-AuthenticodeSignature -LiteralPath $Path
-  if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid) { throw 'invalid Authenticode signature' }
-  if ($null -eq $signature.SignerCertificate) { throw 'missing Authenticode signer' }
-  $actualName = ($signature.SignerCertificate.Subject -split ',\s*' | ForEach-Object { $_.Trim() -replace '^ST\s*=', 'S=' } | Sort-Object) -join ','
-  $expectedName = ($Subject -split ',\s*' | ForEach-Object { $_.Trim() -replace '^ST\s*=', 'S=' } | Sort-Object) -join ','
-  if ($actualName -ine $expectedName) { throw 'unexpected Authenticode subject' }
-  if ($null -eq $signature.TimeStamperCertificate) { throw 'missing trusted timestamp' }
-  [pscustomobject]@{
-    subject = $signature.SignerCertificate.Subject
-    timestamp_subject = $signature.TimeStamperCertificate.Subject
+  $signTool = Join-Path $env:LOCALAPPDATA 'ArtifactSigning\Microsoft.Windows.SDK.BuildTools\Microsoft.Windows.SDK.BuildTools.10.0.26100.4188\bin\10.0.26100.0\x64\signtool.exe'
+  if (-not [System.IO.File]::Exists($signTool)) { throw 'pinned Artifact Signing module unavailable' }
+  # SignTool defaults to the embedded signature, avoiding catalog precedence.
+  & $signTool verify /pa /all /tw /q $Path
+  if ($LASTEXITCODE -ne 0) { throw 'invalid Authenticode signature' }
+  $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate]::CreateFromSignedFile($Path)
+  try {
+    $actualName = ($certificate.Subject -split ',\s*' | ForEach-Object { $_.Trim() -replace '^ST\s*=', 'S=' } | Sort-Object) -join ','
+    $expectedName = ($Subject -split ',\s*' | ForEach-Object { $_.Trim() -replace '^ST\s*=', 'S=' } | Sort-Object) -join ','
+    if ($actualName -ine $expectedName) { throw 'unexpected Authenticode subject' }
+    [pscustomobject]@{
+      subject = $certificate.Subject
+      timestamp_verified = $true
+    }
+  } finally {
+    $certificate.Dispose()
   }
 }
 
