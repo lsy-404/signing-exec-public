@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { execFile } from 'node:child_process';
-import { createReadStream } from 'node:fs';
+import { createReadStream, writeSync } from 'node:fs';
 import { chmod, mkdir, mkdtemp, open, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -22,7 +22,7 @@ const PART_TIMEOUT_MS = 300_000;
 const ZIP = '/usr/bin/zip';
 const SAFE_OUTPUTS = new Set(['signed.tar.gz', 'product.zip', 'signed.dmg', 'product.dmg', 'product.exe', 'product-portable.exe', 'RELEASES']);
 const safeOutput = name => SAFE_OUTPUTS.has(name) || /^[A-Za-z0-9][A-Za-z0-9_.-]*-full\.nupkg$/.test(name);
-const SAFE_WINDOWS_FAILURE = /^Windows signing operation failed: (?:input_archive|archive_validation|static_verification|authorization|codesign|packaging|signature_verification)(?: \[(?:(?:app|nsis|squirrel):(?:Inspect|Sign|SignFolder|Verify):(?:aadsts_\d{5,9}|hresult_0x[0-9a-f]{8}|http_status_[45]\d{2}|ps_(?:product_version_missing|authenticode_invalid|signer_missing|subject_unexpected|timestamp_missing|path_outside_root|inspection_outside_app|directory_outside_app|directory_missing|file_missing|file_type_unsupported|module_missing|command_missing|no_files_to_sign|dotnet8_missing)|(?:signtool|signcli|powershell)_exit_(?:0|[1-9]\d?|1\d{2}|2[0-4]\d|25[0-5])|powershell_failed|process_unavailable|output_limit|response_invalid)|squirrel_(?:vendor_prepare|vendor_sign|temp_validate|installer_create|output_validate|setup_verify|output_copy)|client:(?:API_[A-Z_]{1,64}|HEARTBEAT_FAILED|INVALID_RESPONSE|CREDENTIALS_ALREADY_REQUESTED))\])?$/;
+const SAFE_WINDOWS_FAILURE = /^Windows signing operation failed: (?:input_archive|archive_validation|static_verification|authorization|codesign|packaging|signature_verification)(?: \[(?:(?:app|nsis|squirrel):(?:Inspect|Sign|SignFolder|Verify):(?:aadsts_\d{5,9}|hresult_0x[0-9a-f]{8}|http_status_[45]\d{2}|ps_(?:product_version_missing|authenticode_invalid|signer_missing|subject_unexpected|timestamp_missing|path_outside_root|inspection_outside_app|directory_outside_app|directory_missing|file_missing|file_type_unsupported|module_missing|command_missing|no_files_to_sign|dotnet8_missing)|(?:signtool|signcli|powershell)_exit_(?:0|[1-9]\d?|1\d{2}|2[0-4]\d|25[0-5])|powershell_failed|process_unavailable|output_limit|response_invalid)|nsis_(?:prepare|builder|configuration|tool_execution|dependency_missing|access_denied|callback_scope|callback_type|callback_file|output_verify|output_copy|app_verify)|squirrel_(?:vendor_prepare|vendor_sign|temp_validate|installer_create|output_validate|setup_verify|output_copy)|client:(?:API_[A-Z_]{1,64}|HEARTBEAT_FAILED|INVALID_RESPONSE|CREDENTIALS_ALREADY_REQUESTED))\])?$/;
 
 export class ClientError extends Error {
   constructor(code, status = 0) { super(code); this.code = code; this.status = status; }
@@ -391,9 +391,12 @@ export async function main(args = process.argv.slice(2)) {
   } catch (error) {
     const native = error instanceof Error && (/^(?:macOS signing operation failed: [a-z_]{1,64}|disk image operation failed: [a-z-]{1,64}|disk image cleanup failed)$/.test(error.message) || SAFE_WINDOWS_FAILURE.test(error.message));
     const code = error instanceof ClientError ? error.code : native ? error.message : 'CLIENT_FAILED';
-    process.stderr.write(`${code}\n`);
+    writeSync(2, `${code}\n`);
     process.exitCode = 1;
   }
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) await main();
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  await main();
+  if (process.exitCode === 1) process.exit(1);
+}

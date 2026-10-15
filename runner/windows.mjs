@@ -401,64 +401,84 @@ async function collectReportFiles(output, manifest, productName) {
 }
 
 async function signNsis(manifest, appDir, work, output, signOne, signScript, configPath) {
-  const projectDir = path.join(work, 'builder-project');
-  const buildDir = path.join(work, 'builder-output');
-  await mkdir(projectDir, { recursive: false, mode: 0o700 });
-  await mkdir(buildDir, { recursive: false, mode: 0o700 });
-  const packageName = `${manifest.windows.product_name}-${manifest.architecture}`.toLowerCase().replace(/[^a-z0-9_.-]/g, '-');
-  const packageJson = {
-    name: packageName,
-    version: manifest.version,
-    productName: manifest.windows.product_name,
-    description: manifest.windows.product_name,
-    author: 'VOIDCARVE LABS',
-  };
-  await writeFile(path.join(projectDir, 'package.json'), JSON.stringify(packageJson), { flag: 'wx', mode: 0o600 });
-  const name = manifest.windows.executable_name.slice(0, -4);
-  const { Arch, Platform, build } = await import('electron-builder');
-  await build({
-    targets: Platform.WINDOWS.createTarget(['nsis', ...(manifest.windows.portable ? ['portable'] : [])], manifest.architecture === 'x64' ? Arch.x64 : Arch.arm64),
-    projectDir,
-    prepackaged: appDir,
-    config: {
-      extends: null,
-      appId: manifest.bundle_id,
+  let phase = 'nsis_prepare';
+  try {
+    const projectDir = path.join(work, 'builder-project');
+    const buildDir = path.join(work, 'builder-output');
+    await mkdir(projectDir, { recursive: false, mode: 0o700 });
+    await mkdir(buildDir, { recursive: false, mode: 0o700 });
+    const packageName = `${manifest.windows.product_name}-${manifest.architecture}`.toLowerCase().replace(/[^a-z0-9_.-]/g, '-');
+    const packageJson = {
+      name: packageName,
+      version: manifest.version,
       productName: manifest.windows.product_name,
-      electronVersion: manifest.windows.electron_version,
-      directories: { output: buildDir },
-      win: {
-        icon: path.join(appDir,'resources','installer.ico'),
-        executableName: name,
-        target: ['nsis', ...(manifest.windows.portable ? ['portable'] : [])],
-        signExts: ['.exe', '.EXE', '.dll', '.DLL', '.node', '.NODE'],
-        signExecutable: true,
-        signtoolOptions: {
-          publisherName: 'VOIDCARVE LABS',
-          signingHashAlgorithms: ['sha256'],
-          rfc3161TimeStampServer: TIMESTAMP_URL,
-          sign: async task => signOne(task.path),
+      description: manifest.windows.product_name,
+      author: 'VOIDCARVE LABS',
+    };
+    await writeFile(path.join(projectDir, 'package.json'), JSON.stringify(packageJson), { flag: 'wx', mode: 0o600 });
+    const name = manifest.windows.executable_name.slice(0, -4);
+    const { Arch, Platform, build } = await import('electron-builder');
+    phase = 'nsis_builder';
+    await build({
+      targets: Platform.WINDOWS.createTarget(['nsis', ...(manifest.windows.portable ? ['portable'] : [])], manifest.architecture === 'x64' ? Arch.x64 : Arch.arm64),
+      projectDir,
+      prepackaged: appDir,
+      config: {
+        extends: null,
+        appId: manifest.bundle_id,
+        productName: manifest.windows.product_name,
+        electronVersion: manifest.windows.electron_version,
+        directories: { output: buildDir },
+        win: {
+          icon: path.join(appDir,'resources','installer.ico'),
+          executableName: name,
+          target: ['nsis', ...(manifest.windows.portable ? ['portable'] : [])],
+          signExts: ['.exe', '.EXE', '.dll', '.DLL', '.node', '.NODE'],
+          signExecutable: true,
+          signtoolOptions: {
+            publisherName: 'VOIDCARVE LABS',
+            signingHashAlgorithms: ['sha256'],
+            rfc3161TimeStampServer: TIMESTAMP_URL,
+            sign: async task => signOne(task.path),
+          },
         },
+        nsis: {
+          installerIcon: path.join(appDir,'resources','installer.ico'),
+          uninstallerIcon: path.join(appDir,'resources','installer.ico'),
+          oneClick: false,
+          perMachine: false,
+          allowToChangeInstallationDirectory: false,
+          artifactName: 'product.exe',
+        },
+        portable: { artifactName: 'product-portable.exe' },
+        publish: null,
       },
-      nsis: {
-        installerIcon: path.join(appDir,'resources','installer.ico'),
-        uninstallerIcon: path.join(appDir,'resources','installer.ico'),
-        oneClick: false,
-        perMachine: false,
-        allowToChangeInstallationDirectory: false,
-        artifactName: 'product.exe',
-      },
-      portable: { artifactName: 'product-portable.exe' },
-      publish: null,
-    },
-  });
-  const products = ['product.exe', ...(manifest.windows.portable ? ['product-portable.exe'] : [])];
-  for (const filename of products) await invokePowerShell(signScript, 'Verify', configPath, path.join(buildDir, filename), 'nsis');
-  for (const filename of products) {
-    const source = path.join(buildDir, filename);
-    await copyOutput(source, output, filename, manifest.max_artifact_bytes);
+    });
+    const products = ['product.exe', ...(manifest.windows.portable ? ['product-portable.exe'] : [])];
+    phase = 'nsis_output_verify';
+    for (const filename of products) await invokePowerShell(signScript, 'Verify', configPath, path.join(buildDir, filename), 'nsis');
+    phase = 'nsis_output_copy';
+    for (const filename of products) {
+      const source = path.join(buildDir, filename);
+      await copyOutput(source, output, filename, manifest.max_artifact_bytes);
+    }
+    phase = 'nsis_app_verify';
+    const originalAppFiles = await walkSignableFiles(appDir);
+    for (const file of originalAppFiles) await invokePowerShell(signScript, 'Verify', configPath, file, 'app');
+  } catch (error) {
+    if (error instanceof PowerShellFailure || error instanceof PackagingFailure) throw error;
+    const builderCodes = {
+      ERR_ELECTRON_BUILDER_INVALID_CONFIGURATION: 'nsis_configuration',
+      ERR_ELECTRON_BUILDER_CANNOT_EXECUTE: 'nsis_tool_execution',
+      MODULE_NOT_FOUND: 'nsis_dependency_missing',
+      ERR_MODULE_NOT_FOUND: 'nsis_dependency_missing',
+      ENOENT: 'nsis_dependency_missing',
+      EACCES: 'nsis_access_denied',
+      EPERM: 'nsis_access_denied',
+    };
+    if (phase === 'nsis_builder' && Object.hasOwn(builderCodes, error?.code)) throw new PackagingFailure(builderCodes[error.code]);
+    throw new PackagingFailure(phase);
   }
-  const originalAppFiles = await walkSignableFiles(appDir);
-  for (const file of originalAppFiles) await invokePowerShell(signScript, 'Verify', configPath, file, 'app');
 }
 
 async function signSquirrel(manifest, appDir, work, output, signScript, configPath) {
@@ -612,12 +632,12 @@ async function execute(manifestInput, inputZip, outputDir, authorize) {
     const signOne = async file => {
       const absolute = path.resolve(file);
       if (absolute !== path.resolve(executable) && !contained(path.resolve(appDir), absolute) && !contained(path.resolve(work, 'builder-output'), absolute)) {
-        throw new Error('signer requested an out-of-scope file');
+        throw new PackagingFailure('nsis_callback_scope');
       }
       const extension = path.extname(absolute).toLowerCase();
-      if (!SIGNABLE_EXTENSIONS.has(extension)) throw new Error('signer requested a non-PE file');
+      if (!SIGNABLE_EXTENSIONS.has(extension)) throw new PackagingFailure('nsis_callback_type');
       const metadata = await lstat(absolute);
-      if (!metadata.isFile() || metadata.isSymbolicLink()) throw new Error('signer requested an invalid file');
+      if (!metadata.isFile() || metadata.isSymbolicLink()) throw new PackagingFailure('nsis_callback_file');
       try {
         await invokePowerShell(script, 'Verify', configPath, absolute, 'nsis');
       } catch {
